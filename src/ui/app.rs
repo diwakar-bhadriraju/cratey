@@ -37,6 +37,8 @@ pub struct App {
     toast_overlay: adw::ToastOverlay,
     /// apps indices currently shown in the list (search-filtered order).
     visible: Vec<usize>,
+    /// While true, the row-selected handler ignores events (programmatic rebuild).
+    suppress_selected: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,8 +121,13 @@ impl SimpleComponent for App {
         let list_box = gtk::ListBox::new();
         list_box.set_selection_mode(gtk::SelectionMode::Single);
         list_box.set_css_classes(&["boxed-list"]);
+        let suppress = std::rc::Rc::new(std::cell::Cell::new(false));
         let s = sender.clone();
+        let sp = suppress.clone();
         list_box.connect_row_selected(move |_, row| {
+            if sp.get() {
+                return;
+            }
             if let Some(row) = row.as_ref() {
                 s.input(AppMsg::Select(row.index() as usize));
             }
@@ -210,6 +217,7 @@ impl SimpleComponent for App {
             sidebar_info,
             toast_overlay,
             visible: Vec::new(),
+            suppress_selected: suppress,
         };
         model.rebuild_all(&sender);
 
@@ -347,15 +355,24 @@ impl App {
         self.selected.and_then(|i| self.apps.get(i))
     }
 
-    fn clear_children(&self, widget: &impl IsA<gtk::Widget>) {
-        let w = widget.upcast_ref::<gtk::Widget>();
-        while let Some(child) = w.first_child() {
-            child.unparent();
+    /// Clears the app list. Must use `ListBox::remove` (not `unparent`) so the
+    /// ListBox keeps its internal row bookkeeping consistent.
+    fn clear_list(&mut self) {
+        while let Some(row) = self.list_box.row_at_index(0) {
+            self.list_box.remove(&row);
+        }
+    }
+
+    /// Clears a plain container.
+    fn clear_box(b: &gtk::Box) {
+        while let Some(child) = b.first_child() {
+            b.remove(&child);
         }
     }
 
     fn rebuild_all(&mut self, sender: &ComponentSender<Self>) {
-        self.clear_children(&self.list_box);
+        self.clear_list();
+        self.suppress_selected.set(true);
         let query = self.search_text.to_lowercase();
         self.visible.clear();
         for (i, app) in self.apps.iter().enumerate() {
@@ -372,11 +389,12 @@ impl App {
             action.add_prefix(&img);
             action.set_title(&app.display_name);
             action.set_subtitle(&app.installed_path.to_string_lossy());
+            self.list_box.append(&action);
             if self.selected == Some(i) {
                 self.list_box.select_row(Some(&action));
             }
-            self.list_box.append(&action);
         }
+        self.suppress_selected.set(false);
         self.list_box.set_visible(!self.apps.is_empty());
         self.sidebar_info.set_visible(self.apps.is_empty());
 
@@ -384,7 +402,7 @@ impl App {
     }
 
     fn rebuild_details(&mut self, sender: &ComponentSender<Self>) {
-        self.clear_children(&self.details_box);
+        Self::clear_box(&self.details_box);
         let Some(app) = self.selected_app() else {
             self.details_stack.set_visible_child_name("empty");
             return;
