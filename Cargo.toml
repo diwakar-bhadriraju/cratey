@@ -1,0 +1,62 @@
+[package]
+name = "cratey"
+version = "0.1.0"
+edition = "2021"
+description = "Native Linux AppImage manager"
+license = "MIT"
+
+[[bin]]
+name = "cratey"
+path = "src/main.rs"
+
+[dependencies]
+gtk4         = { version = "0.11", features = ["v4_12"] }
+libadwaita   = { version = "0.9",  features = ["v1_6"] }
+glib         = "0.22"
+gio          = "0.22"
+gdk4         = "0.11"
+gdk-pixbuf   = "0.21"
+pango        = "0.22"
+cairo-rs     = "0.21"
+
+relm4        = { version = "0.11", features = ["libadwaita"] }
+relm4-icons  = "0.11"
+
+directories  = "6"
+xdg          = "3"
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+toml         = "1"
+toml_edit    = "0.22"
+
+ureq         = { version = "3", features = ["rustls", "json"] }
+chrono       = { version = "0.4", features = ["serde"] }
+sha2         = "0.11"
+sha1         = "0.10"
+hex          = "0.4"
+goblin       = "0.10"
+walkdir      = "2"
+regex        = "1"
+ulid         = "1"
+fs2          = "0.4"
+
+clap         = { version = "4", features = ["derive"] }
+anyhow       = "1"
+thiserror    = "2"
+log          = "0.4"
+env_logger   = "0.11"
+mime_guess   = "2"
+infer        = "0.16"
+libc         = "0.2"
+tempfile     = "3"
+
+[dependencies.image]
+version          = "0.25"
+default-features = false
+features         = ["png"]
+
+[dev-dependencies]
+wiremock     = "0.6"
+assert_cmd   = "2"
+predicates   = "3"
+parking_lot  = "0.12"

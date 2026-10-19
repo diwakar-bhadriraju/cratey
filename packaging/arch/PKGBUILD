@@ -1,0 +1,25 @@
+# Maintainer: Diwakar Bhadriraju <diwakar.bhadriraju@example.invalid>
+# Draft for future AUR submission — not yet registered.
+
+pkgname=cratey
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Native Linux AppImage manager"
+arch=('x86_64')
+url="https://github.com/diwakar-bhadriraju/cratey"
+license=('MIT')
+depends=('gtk4' 'libadwaita1' 'glib2' 'libpng' 'desktop-file-utils')
+makedepends=('cargo' 'rust' 'pkgconf')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/diwakar-bhadriraju/cratey/archive/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+    cd "$pkgname-$pkgver"
+    cargo build --release --locked --jobs 2
+}
+
+package() {
+    cd "$pkgname-$pkgver"
+    install -Dm755 target/release/cratey "$pkgdir/usr/bin/cratey"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

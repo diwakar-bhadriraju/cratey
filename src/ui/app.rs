@@ -1,0 +1,803 @@
+//! Main application model and UI (built imperatively for reliability).
+//!
+//! This module implements `SimpleComponent` by hand (no `view!` macro) so the
+//! whole window can be constructed and rebuilt imperatively.
+
+use std::path::PathBuf;
+
+use relm4::adw;
+use relm4::adw::prelude::*;
+use relm4::gtk;
+use relm4::gtk::gdk;
+use relm4::{ComponentParts, ComponentSender, RelmWidgetExt, SimpleComponent};
+
+use crate::db::Db;
+use crate::error::Result;
+use crate::integration::PlannedInstall;
+use crate::model::{
+    ImportMode, IntegrationStatus, ManagedApp, Settings, UpdateProvider, UpdateStatus,
+};
+use crate::paths;
+use crate::update::UpdateProvider as _;
+
+/// Top-level model; stores widget handles so `update` can rebuild the dynamic
+/// sections (app list + details).
+pub struct App {
+    apps: Vec<ManagedApp>,
+    selected: Option<usize>,
+    settings: Settings,
+    search_text: String,
+
+    root: adw::Window,
+    list_box: gtk::ListBox,
+    details_box: gtk::Box,
+    details_stack: gtk::Stack,
+    sidebar_info: gtk::Label,
+    toast_overlay: adw::ToastOverlay,
+    /// apps indices currently shown in the list (search-filtered order).
+    visible: Vec<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub enum AppMsg {
+    Refresh,
+    Select(usize),
+    ImportFiles(Vec<PathBuf>),
+    DoInstall {
+        source: PathBuf,
+        base_dir: PathBuf,
+        display: String,
+        mode: ImportMode,
+    },
+    Launch,
+    OpenLocation,
+    Rename(String),
+    Repair,
+    Uninstall,
+    CheckUpdates,
+    Preferences,
+    SetBaseDir(PathBuf),
+    SetImportMode(ImportMode),
+    SearchChanged(String),
+    ShowToast(String),
+    ClosePreview,
+}
+
+impl SimpleComponent for App {
+    type Init = ();
+    type Input = AppMsg;
+    type Output = ();
+    type Root = adw::Window;
+    type Widgets = ();
+
+    fn init_root() -> Self::Root {
+        adw::Window::new()
+    }
+
+    fn init(
+        _init: Self::Init,
+        root: Self::Root,
+        sender: ComponentSender<Self>,
+    ) -> ComponentParts<Self> {
+        let (apps, settings) = load_state();
+
+        let toast_overlay = adw::ToastOverlay::new();
+        root.set_content(Some(&toast_overlay));
+
+        // Whole-window file drag-and-drop.
+        let drop_target = gtk::DropTarget::builder()
+            .formats(&gdk::ContentFormats::new(&["text/uri-list"]))
+            .actions(gdk::DragAction::COPY)
+            .build();
+        let s = sender.clone();
+        drop_target.connect_drop(move |_w, value, _x, _y| {
+            if let Ok(list) = value.get::<gdk::FileList>() {
+                let paths: Vec<PathBuf> = list
+                    .files()
+                    .iter()
+                    .filter_map(|f| f.path().map(|p| p.to_path_buf()))
+                    .collect();
+                if !paths.is_empty() {
+                    s.input(AppMsg::ImportFiles(paths));
+                    return true;
+                }
+            }
+            false
+        });
+        root.add_controller(drop_target);
+
+        // --- Sidebar: search + list + guidance ---
+        let list_box = gtk::ListBox::new();
+        list_box.set_selection_mode(gtk::SelectionMode::Single);
+        list_box.set_css_classes(&["boxed-list"]);
+        let s = sender.clone();
+        list_box.connect_row_selected(move |_, row| {
+            if let Some(row) = row.as_ref() {
+                s.input(AppMsg::Select(row.index() as usize));
+            }
+        });
+
+        let search = gtk::SearchEntry::new();
+        search.set_placeholder_text(Some("Search apps"));
+        let s = sender.clone();
+        search.connect_changed(move |e| s.input(AppMsg::SearchChanged(e.text().to_string())));
+
+        let browse = gtk::Button::with_label("Browse…");
+        browse.set_halign(gtk::Align::Center);
+        let s = sender.clone();
+        browse.connect_clicked(move |_| open_file_picker(s.clone()));
+
+        let sidebar_info = gtk::Label::new(Some(
+            "Drop AppImages here, or pick a storage directory in Preferences.",
+        ));
+        sidebar_info.set_wrap(true);
+        sidebar_info.set_justify(gtk::Justification::Center);
+        sidebar_info.add_css_class("dim-label");
+
+        let sidebar = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        sidebar.set_width_request(300);
+        sidebar.append(&search);
+        let scrolled = gtk::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&list_box));
+        sidebar.append(&scrolled);
+        sidebar.append(&browse);
+        sidebar.append(&sidebar_info);
+
+        // --- Right pane: empty state / details stack ---
+        let details_stack = gtk::Stack::new();
+        details_stack.set_vexpand(true);
+        details_stack.set_hexpand(true);
+
+        let empty_page = adw::StatusPage::new();
+        empty_page.set_icon_name(Some("application-x-executable-symbolic"));
+        empty_page.set_title("No app selected");
+        empty_page.set_description(Some("Pick an app from the list on the left."));
+        details_stack.add_named(&empty_page, Some("empty"));
+
+        let details_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        details_stack.add_named(&details_box, Some("details"));
+
+        let split = adw::OverlaySplitView::new();
+        split.set_show_sidebar(true);
+        split.set_sidebar(Some(&sidebar));
+        split.set_content(Some(&details_stack));
+
+        toast_overlay.set_child(Some(&split));
+        root.set_title(Some("Cratey"));
+
+        let mut model = App {
+            apps,
+            selected: None,
+            settings,
+            search_text: String::new(),
+            root: root.clone(),
+            list_box,
+            details_box,
+            details_stack,
+            sidebar_info,
+            toast_overlay,
+            visible: Vec::new(),
+        };
+        model.rebuild_all(&sender);
+
+        if model.settings.base_dir.is_none() {
+            sender.input(AppMsg::Preferences);
+        }
+
+        ComponentParts { model, widgets: () }
+    }
+
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
+        match msg {
+            AppMsg::Refresh => self.rebuild_all(&sender),
+            AppMsg::Select(pos) => {
+                if let Some(real) = self.visible.get(pos) {
+                    self.selected = Some(*real);
+                    self.rebuild_all(&sender);
+                }
+            }
+            AppMsg::ImportFiles(paths) => self.import_files(paths, &sender),
+            AppMsg::DoInstall {
+                source,
+                base_dir,
+                display,
+                mode,
+            } => {
+                self.do_install(source, base_dir, display, mode, &sender);
+                sender.input(AppMsg::Refresh);
+            }
+            AppMsg::Launch => {
+                if let Some(app) = self.selected_app() {
+                    match crate::integration::launch::launch(app) {
+                        Ok(pid) => sender.input(AppMsg::ShowToast(format!("Launched (pid {pid})"))),
+                        Err(e) => sender.input(AppMsg::ShowToast(format!("Launch failed: {e}"))),
+                    }
+                }
+            }
+            AppMsg::OpenLocation => {
+                if let Some(app) = self.selected_app() {
+                    open_in_file_manager(&app.installed_path);
+                }
+            }
+            AppMsg::Rename(name) => {
+                if let Some(idx) = self.selected {
+                    if !name.trim().is_empty() {
+                        self.apps[idx].display_name = name.trim().to_string();
+                        self.commit_state();
+                        sender.input(AppMsg::Refresh);
+                    }
+                }
+            }
+            AppMsg::Repair => {
+                if let Some(app) = self.selected_app().cloned() {
+                    match repair_app(&app) {
+                        Ok(()) => self.toast("Integration repaired"),
+                        Err(e) => self.toast(format!("Repair failed: {e}")),
+                    }
+                    sender.input(AppMsg::Refresh);
+                }
+            }
+            AppMsg::Uninstall => self.confirm_uninstall(&sender),
+            AppMsg::CheckUpdates => {
+                if let Some(app) = self.selected_app() {
+                    self.check_updates(app.clone(), &sender);
+                }
+            }
+            AppMsg::Preferences => {
+                if self.settings.base_dir.is_none() {
+                    open_folder_picker(sender.clone());
+                } else {
+                    self.show_preferences_window();
+                }
+            }
+            AppMsg::SetBaseDir(dir) => {
+                self.settings.base_dir = Some(dir);
+                self.commit_settings();
+                self.toast("Storage directory set");
+                sender.input(AppMsg::Refresh);
+            }
+            AppMsg::SetImportMode(m) => {
+                self.settings.default_import_mode = m;
+                self.commit_settings();
+            }
+            AppMsg::SearchChanged(s) => {
+                self.search_text = s;
+                self.rebuild_all(&sender);
+            }
+            AppMsg::ShowToast(text) => self.toast(text),
+            AppMsg::ClosePreview => {}
+        }
+    }
+}
+
+impl App {
+    fn toast(&self, text: impl Into<String>) {
+        let toast = adw::Toast::new(&text.into());
+        self.toast_overlay.add_toast(toast);
+    }
+
+    fn selected_app(&self) -> Option<&ManagedApp> {
+        self.selected.and_then(|i| self.apps.get(i))
+    }
+
+    fn clear_children(&self, widget: &impl IsA<gtk::Widget>) {
+        let w = widget.upcast_ref::<gtk::Widget>();
+        while let Some(child) = w.first_child() {
+            child.unparent();
+        }
+    }
+
+    fn rebuild_all(&mut self, sender: &ComponentSender<Self>) {
+        self.clear_children(&self.list_box);
+        let query = self.search_text.to_lowercase();
+        self.visible.clear();
+        for (i, app) in self.apps.iter().enumerate() {
+            if !query.is_empty()
+                && !app.display_name.to_lowercase().contains(&query)
+                && !app.source_filename.to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            self.visible.push(i);
+            let action = adw::ActionRow::new();
+            let img = gtk::Image::from_icon_name("application-x-executable-symbolic");
+            img.set_pixel_size(24);
+            action.add_prefix(&img);
+            action.set_title(&app.display_name);
+            action.set_subtitle(&app.installed_path.to_string_lossy());
+            if self.selected == Some(i) {
+                self.list_box.select_row(Some(&action));
+            }
+            self.list_box.append(&action);
+        }
+        self.list_box.set_visible(!self.apps.is_empty());
+        self.sidebar_info.set_visible(self.apps.is_empty());
+
+        self.rebuild_details(sender);
+    }
+
+    fn rebuild_details(&mut self, sender: &ComponentSender<Self>) {
+        self.clear_children(&self.details_box);
+        let Some(app) = self.selected_app() else {
+            self.details_stack.set_visible_child_name("empty");
+            return;
+        };
+        self.details_stack.set_visible_child_name("details");
+
+        let page = adw::PreferencesPage::new();
+
+        let id_group = adw::PreferencesGroup::new();
+        id_group.set_title("Identity");
+        add_info_row(&id_group, "Name", &app.display_name);
+        add_info_row(
+            &id_group,
+            "Version",
+            app.known_version.as_deref().unwrap_or("unknown"),
+        );
+        add_info_row(&id_group, "Update", &update_status_text(&app.update_status));
+        add_info_row(
+            &id_group,
+            "Integration",
+            &integration_status_text(&app.integration_status),
+        );
+        page.add(&id_group);
+
+        let path_group = adw::PreferencesGroup::new();
+        path_group.set_title("Paths");
+        add_info_row(&path_group, "Binary", &app.installed_path.to_string_lossy());
+        add_info_row(
+            &path_group,
+            "Desktop file",
+            &app.desktop_file_path.to_string_lossy(),
+        );
+        page.add(&path_group);
+
+        let act_group = adw::PreferencesGroup::new();
+        act_group.set_title("Actions");
+
+        let launch = gtk::Button::with_label("Launch");
+        launch.set_halign(gtk::Align::Start);
+        launch.add_css_class("suggested-action");
+        {
+            let s = sender.clone();
+            launch.connect_clicked(move |_| s.input(AppMsg::Launch));
+        }
+        act_group.add(&launch);
+
+        let open = gtk::Button::with_label("Open location");
+        open.set_halign(gtk::Align::Start);
+        {
+            let s = sender.clone();
+            open.connect_clicked(move |_| s.input(AppMsg::OpenLocation));
+        }
+        act_group.add(&open);
+
+        let rename = gtk::Button::with_label("Rename…");
+        rename.set_halign(gtk::Align::Start);
+        {
+            let s = sender.clone();
+            let current = app.display_name.clone();
+            rename.connect_clicked(move |_| prompt_rename(current.clone(), s.clone()));
+        }
+        act_group.add(&rename);
+
+        if matches!(app.integration_status, IntegrationStatus::Healthy) {
+            let check = gtk::Button::with_label("Check for updates");
+            check.set_halign(gtk::Align::Start);
+            {
+                let s = sender.clone();
+                check.connect_clicked(move |_| s.input(AppMsg::CheckUpdates));
+            }
+            act_group.add(&check);
+        } else {
+            let repair = gtk::Button::with_label("Repair integration");
+            repair.set_halign(gtk::Align::Start);
+            {
+                let s = sender.clone();
+                repair.connect_clicked(move |_| s.input(AppMsg::Repair));
+            }
+            act_group.add(&repair);
+        }
+
+        let uninstall = gtk::Button::with_label("Uninstall…");
+        uninstall.set_halign(gtk::Align::Start);
+        uninstall.add_css_class("destructive-action");
+        {
+            let s = sender.clone();
+            uninstall.connect_clicked(move |_| s.input(AppMsg::Uninstall));
+        }
+        act_group.add(&uninstall);
+
+        page.add(&act_group);
+
+        let clamp = adw::Clamp::new();
+        clamp.set_child(Some(&page));
+        let scrolled = gtk::ScrolledWindow::new();
+        scrolled.set_vexpand(true);
+        scrolled.set_child(Some(&clamp));
+        self.details_box.append(&scrolled);
+    }
+
+    fn import_files(&mut self, paths: Vec<PathBuf>, sender: &ComponentSender<Self>) {
+        if self.settings.base_dir.is_none() {
+            self.toast("Choose a storage directory first");
+            open_folder_picker(sender.clone());
+            return;
+        }
+        for path in paths {
+            match crate::appimage::format::detect(&path) {
+                Ok(_) => self.show_preview(path, sender),
+                Err(e) => self.toast(format!("Not a valid AppImage: {e}")),
+            }
+        }
+    }
+
+    fn show_preview(&mut self, path: PathBuf, sender: &ComponentSender<Self>) {
+        let base_dir = self.settings.base_dir.clone().unwrap();
+
+        let window = adw::Window::new();
+        window.set_title(Some("Import Preview"));
+        window.set_modal(true);
+        window.set_resizable(false);
+        window.set_default_width(500);
+        window.set_transient_for(Some(&self.root));
+
+        let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        body.set_margin_all(16);
+
+        let suggested = path
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "Untitled App".into());
+
+        let entry_row = adw::EntryRow::new();
+        entry_row.set_title("Display name");
+        entry_row.set_text(&suggested);
+        body.append(&entry_row);
+
+        let mode_combo = adw::ComboRow::new();
+        mode_combo.set_title("Import mode");
+        let m = gtk::StringList::new(&["Copy", "Move"]);
+        mode_combo.set_model(Some(&m));
+        mode_combo.set_selected(0);
+        body.append(&mode_combo);
+
+        let src_row = adw::ActionRow::new();
+        src_row.set_title("Source");
+        src_row.set_subtitle(&path.to_string_lossy());
+        body.append(&src_row);
+
+        let btns = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        btns.set_halign(gtk::Align::End);
+
+        let cancel = gtk::Button::with_label("Cancel");
+        let s = sender.clone();
+        let w = window.clone();
+        cancel.connect_clicked(move |_| {
+            s.input(AppMsg::ClosePreview);
+            w.close();
+        });
+        btns.append(&cancel);
+
+        let install = gtk::Button::with_label("Install");
+        install.add_css_class("suggested-action");
+        let s = sender.clone();
+        let w = window.clone();
+        let path2 = path.clone();
+        let base2 = base_dir.clone();
+        let combo = mode_combo.clone();
+        let entry2 = entry_row.clone();
+        install.connect_clicked(move |_| {
+            let mode = if combo.selected() == 1 {
+                ImportMode::Move
+            } else {
+                ImportMode::Copy
+            };
+            s.input(AppMsg::DoInstall {
+                source: path2.clone(),
+                base_dir: base2.clone(),
+                display: entry2.text().to_string(),
+                mode,
+            });
+            w.close();
+        });
+        btns.append(&install);
+        body.append(&btns);
+
+        let tbv = adw::ToolbarView::new();
+        tbv.add_top_bar(&adw::HeaderBar::new());
+        tbv.set_content(Some(&body));
+        window.set_content(Some(&tbv));
+        window.present();
+    }
+
+    fn do_install(
+        &mut self,
+        source: PathBuf,
+        base_dir: PathBuf,
+        display: String,
+        mode: ImportMode,
+        _sender: &ComponentSender<Self>,
+    ) {
+        let id = crate::model::new_app_id();
+        let installed = base_dir.join(
+            source
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "app.AppImage".into()),
+        );
+        let icon = paths::icons_dir().join(format!("{id}.png"));
+        let desktop = paths::applications_dir().join(crate::model::desktop_file_basename(&id));
+        let plan = PlannedInstall {
+            id: id.clone(),
+            display_name: display,
+            source_path: source,
+            installed_path: installed,
+            icon_path: icon,
+            desktop_file_path: desktop,
+            base_dir: Some(base_dir),
+            move_source: mode == ImportMode::Move,
+        };
+        match crate::integration::install::install(plan) {
+            Ok(app) => {
+                if let Some(existing) = self.apps.iter_mut().find(|a| a.id == app.id) {
+                    *existing = app;
+                } else {
+                    self.apps.push(app);
+                }
+                self.commit_state();
+                self.toast("Installed");
+            }
+            Err(e) => self.toast(format!("Install failed: {e}")),
+        }
+    }
+
+    fn commit_state(&self) {
+        if let Ok(mut db) = Db::open() {
+            db.document_mut().settings = self.settings.clone();
+            for a in &self.apps {
+                if let Some(existing) = db.find_mut(&a.id) {
+                    *existing = a.clone();
+                } else {
+                    db.apps_mut().push(a.clone());
+                }
+            }
+            let _ = db.commit();
+        }
+    }
+
+    fn commit_settings(&self) {
+        if let Ok(mut db) = Db::open() {
+            db.document_mut().settings = self.settings.clone();
+            let _ = db.commit();
+        }
+    }
+
+    fn check_updates(&self, app: ManagedApp, sender: &ComponentSender<Self>) {
+        if matches!(app.update_provider, UpdateProvider::None) {
+            self.toast("No update source configured for this app");
+            return;
+        }
+        let s = sender.clone();
+        run_blocking(
+            move || match crate::update::github::check_for_updates(&app, None) {
+                Ok(crate::update::UpdateOutcome::Available(new)) => {
+                    let mut updated = app.clone();
+                    updated.update_status = UpdateStatus::Checking;
+                    let provider = crate::update::manual::ManualProvider;
+                    match provider.apply(&mut updated, new) {
+                        Ok(()) => s.input(AppMsg::ShowToast("Update applied".into())),
+                        Err(e) => s.input(AppMsg::ShowToast(format!("Update failed: {e}"))),
+                    }
+                }
+                Ok(crate::update::UpdateOutcome::NoUpdate) => {
+                    s.input(AppMsg::ShowToast("No update available".into()))
+                }
+                Ok(crate::update::UpdateOutcome::Failed(m)) => {
+                    s.input(AppMsg::ShowToast(format!("Check failed: {m}")))
+                }
+                Err(e) => s.input(AppMsg::ShowToast(format!("Check failed: {e}"))),
+            },
+        );
+    }
+
+    fn confirm_uninstall(&mut self, sender: &ComponentSender<Self>) {
+        let Some(app) = self.selected_app().cloned() else {
+            return;
+        };
+        let dialog = adw::AlertDialog::builder()
+            .heading("Uninstall")
+            .body(format!(
+                "Remove {}? Choosing 'integration and binary' deletes the AppImage, its icon and its menu entry.",
+                app.display_name
+            ))
+            .close_response("keep")
+            .default_response("keep")
+            .build();
+        dialog.add_response("keep", "Keep");
+        dialog.add_response("int", "Remove integration only");
+        dialog.add_response("bin", "Remove integration and binary");
+        let s = sender.clone();
+        let id = app.id.clone();
+        let owned = app.owned_files.clone();
+        let desktop = app.desktop_file_path.clone();
+        dialog.choose(
+            Some(&self.root),
+            None::<&gtk::gio::Cancellable>,
+            move |response| {
+                let resp = response.to_string();
+                if resp != "keep" {
+                    for p in &owned {
+                        let _ = std::fs::remove_file(p);
+                    }
+                    if resp == "int" {
+                        let _ = std::fs::remove_file(&desktop);
+                    }
+                    if let Ok(mut db) = Db::open() {
+                        db.apps_mut().retain(|a| a.id != id);
+                        let _ = db.commit();
+                    }
+                    s.input(AppMsg::Refresh);
+                }
+            },
+        );
+    }
+
+    fn show_preferences_window(&self) {
+        let dialog = adw::PreferencesDialog::new();
+
+        let storage = adw::PreferencesPage::new();
+        storage.set_title("Storage");
+        let group = adw::PreferencesGroup::new();
+        group.set_title("Storage directory");
+        let row = adw::ActionRow::new();
+        row.set_title("Directory");
+        row.set_subtitle(
+            self.settings
+                .base_dir
+                .as_ref()
+                .map(|b| b.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Not set".into())
+                .as_str(),
+        );
+        group.add(&row);
+        storage.add(&group);
+        dialog.add(&storage);
+
+        dialog.present(Some(&self.root));
+    }
+}
+
+// ---------- free helpers ----------
+
+fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: &str) {
+    let row = adw::ActionRow::new();
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    group.add(&row);
+}
+
+fn update_status_text(s: &UpdateStatus) -> String {
+    match s {
+        UpdateStatus::Unknown => "Unknown".into(),
+        UpdateStatus::UpToDate => "Up to date".into(),
+        UpdateStatus::Available(v) => format!("Update available ({v})"),
+        UpdateStatus::Checking => "Checking…".into(),
+        UpdateStatus::Failed(e) => format!("Failed ({e})"),
+    }
+}
+
+fn integration_status_text(s: &IntegrationStatus) -> String {
+    match s {
+        IntegrationStatus::Healthy => "Healthy".into(),
+        IntegrationStatus::DesktopEntryMissing => "Desktop entry missing".into(),
+        IntegrationStatus::IconMissing => "Icon missing".into(),
+        IntegrationStatus::Broken(e) => format!("Broken ({e})"),
+    }
+}
+
+fn repair_app(app: &ManagedApp) -> Result<()> {
+    if let Some(icon) = &app.icon_path {
+        crate::appimage::icon::synthesize_icon(&app.display_name, icon)?;
+    }
+    let entry = crate::integration::desktop::DesktopEntry::from(app);
+    crate::integration::desktop::write_entry(&app.desktop_file_path, &entry)?;
+    Ok(())
+}
+
+fn load_state() -> (Vec<ManagedApp>, Settings) {
+    match Db::open() {
+        Ok(db) => {
+            let apps = db.apps().to_vec();
+            let settings = db.document().settings.clone();
+            drop(db);
+            (apps, settings)
+        }
+        Err(_) => (Vec::new(), Settings::default()),
+    }
+}
+
+fn run_blocking<F: FnOnce() + Send + 'static>(f: F) {
+    std::thread::spawn(f);
+}
+
+fn open_in_file_manager(path: &std::path::Path) {
+    if let Some(parent) = path.parent() {
+        let _ = std::process::Command::new("xdg-open").arg(parent).spawn();
+    }
+}
+
+fn open_file_picker(sender: ComponentSender<App>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Choose AppImage file")
+        .modal(true)
+        .build();
+    let s = sender.clone();
+    dialog.open(
+        None::<&gtk::Window>,
+        None::<&gtk::gio::Cancellable>,
+        move |res| {
+            if let Ok(file) = res {
+                if let Some(p) = file.path() {
+                    s.input(AppMsg::ImportFiles(vec![p]));
+                }
+            }
+        },
+    );
+}
+
+fn open_folder_picker(sender: ComponentSender<App>) {
+    let dialog = gtk::FileDialog::builder()
+        .title("Choose AppImage storage directory")
+        .modal(true)
+        .build();
+    dialog.select_folder(
+        None::<&gtk::Window>,
+        None::<&gtk::gio::Cancellable>,
+        move |res| {
+            if let Ok(file) = res {
+                if let Some(p) = file.path() {
+                    sender.input(AppMsg::SetBaseDir(p));
+                }
+            }
+        },
+    );
+}
+
+fn prompt_rename(current: String, sender: ComponentSender<App>) {
+    let window = adw::Window::new();
+    window.set_title(Some("Rename"));
+    window.set_modal(true);
+    window.set_resizable(false);
+    window.set_default_width(360);
+
+    let body = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    body.set_margin_all(16);
+    let entry = gtk::Entry::new();
+    entry.set_text(&current);
+    body.append(&entry);
+    let btns = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    btns.set_halign(gtk::Align::End);
+    let cancel = gtk::Button::with_label("Cancel");
+    let w = window.clone();
+    cancel.connect_clicked(move |_| w.close());
+    btns.append(&cancel);
+    let ok = gtk::Button::with_label("Rename");
+    ok.add_css_class("suggested-action");
+    let s = sender.clone();
+    let w = window.clone();
+    let e2 = entry.clone();
+    ok.connect_clicked(move |_| {
+        s.input(AppMsg::Rename(e2.text().to_string()));
+        w.close();
+    });
+    btns.append(&ok);
+    body.append(&btns);
+
+    let tbv = adw::ToolbarView::new();
+    tbv.add_top_bar(&adw::HeaderBar::new());
+    tbv.set_content(Some(&body));
+    window.set_content(Some(&tbv));
+    window.present();
+}
