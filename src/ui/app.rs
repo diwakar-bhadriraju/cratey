@@ -85,8 +85,18 @@ impl SimpleComponent for App {
     type Root = adw::Window;
     type Widgets = ();
 
+    /// Construct the root window. Marking it visible at construction is
+    /// necessary because `RelmApp::run` registers the root via
+    /// `gtk::Application::add_window` and then calls
+    /// `active_window().set_visible(true)` in its `activate` handler. For
+    /// `adw::Window` (which is *not* an `ApplicationWindow`), `add_window`
+    /// doesn't register it as "active", so relm4's set_visible branch never
+    /// fires and the window stays invisible. Pre-marking it visible forces
+    /// the window manager to surface it.
     fn init_root() -> Self::Root {
-        adw::Window::new()
+        let w = adw::Window::new();
+        w.set_visible(true);
+        w
     }
 
     fn init(
