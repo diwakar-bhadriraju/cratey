@@ -85,26 +85,30 @@ impl SimpleComponent for App {
     type Root = adw::Window;
     type Widgets = ();
 
-    /// Construct the root window. Marking it visible at construction is
-    /// necessary because `RelmApp::run` registers the root via
-    /// `gtk::Application::add_window` and then calls
-    /// `active_window().set_visible(true)` in its `activate` handler. For
-    /// `adw::Window` (which is *not* an `ApplicationWindow`), `add_window`
-    /// doesn't register it as "active", so relm4's set_visible branch never
-    /// fires and the window stays invisible. Pre-marking it visible forces
-    /// the window manager to surface it.
-    fn init_root() -> Self::Root {
-        let w = adw::Window::new();
-        w.set_visible(true);
-        w
-    }
+fn init_root() -> Self::Root {
+    adw::Window::new()
+}
 
-    fn init(
-        _init: Self::Init,
-        root: Self::Root,
-        sender: ComponentSender<Self>,
-    ) -> ComponentParts<Self> {
-        let (apps, settings, db_err) = load_state();
+fn init(
+    _init: Self::Init,
+    root: Self::Root,
+    sender: ComponentSender<Self>,
+) -> ComponentParts<Self> {
+    // `RelmApp::run` registers the root via
+    // `gtk::Application::add_window`, then in `activate` calls
+    // `active_window().set_visible(true)` — but only if there IS an
+    // active window. `adw::Window` is a plain GtkWindow, not an
+    // `ApplicationWindow`, so `add_window` registers it but
+    // `active_window()` returns None and relm4's show-on-activate never
+    // fires. Schedule a `present()` after the main loop ticks so we
+    // override whatever relm4 does next.
+    //
+    // We capture only the weak root reference inside a separate non-self
+    // function so the closure doesn't drag in App.
+    let root_for_idle = root.clone();
+    present_after_idle(&root_for_idle);
+
+    let (apps, settings, db_err) = load_state();
 
         let toast_overlay = adw::ToastOverlay::new();
         root.set_content(Some(&toast_overlay));
@@ -1090,6 +1094,16 @@ impl App {
 }
 
 // ---------- free helpers ----------
+
+/// Schedules `present()` on the window on the next main-loop tick. Used to
+/// force a non-`ApplicationWindow` root to show after relm4's startup runs.
+fn present_after_idle(root: &adw::Window) {
+    let r = root.clone();
+    glib::source::idle_add_local_once(move || {
+        r.set_visible(true);
+        r.present();
+    });
+}
 
 fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: &str) {
     let row = adw::ActionRow::new();
