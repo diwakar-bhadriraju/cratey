@@ -41,7 +41,8 @@ jobs:
             ${{ runner.os }}-cargo-
 
       - name: Format
-        run: cargo fmt --check --jobs 2
+        # rustfmt is single-threaded; --jobs is not a valid flag.
+        run: cargo fmt --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings --jobs 2
