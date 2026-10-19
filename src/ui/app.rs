@@ -187,6 +187,11 @@ impl SimpleComponent for App {
         details_stack.add_named(&empty_page, Some("empty"));
 
         let details_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        // The details pane's slot in the split fills the whole right side;
+        // details_box must request that height so its header (icon + name)
+        // doesn't squeeze the action/scrolled content into a tiny strip.
+        details_box.set_vexpand(true);
+        details_box.set_hexpand(true);
         details_stack.add_named(&details_box, Some("details"));
 
         let split = adw::OverlaySplitView::new();
@@ -240,6 +245,17 @@ impl SimpleComponent for App {
             pending_imports: Vec::new(),
         };
         model.rebuild_all(&sender);
+
+        // Test hook: CRATEY_DEBUG_SELECT=idx preselects that app so a screenshot
+        // or e2e check can land on the details pane without a click.
+        if let Ok(sel) = std::env::var("CRATEY_DEBUG_SELECT") {
+            if let Ok(idx) = sel.parse::<usize>() {
+                if idx < model.apps.len() {
+                    model.selected = Some(idx);
+                    model.rebuild_details(&sender);
+                }
+            }
+        }
 
         if model.settings.base_dir.is_none() {
             sender.input(AppMsg::ShowToast(
@@ -1082,19 +1098,22 @@ fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: &str) {
     group.add(&row);
 }
 
-/// Returns the app's real (synthesized) icon scaled to `size` px, falling back
-/// to a symbolic placeholder when the icon file is missing.
+/// Returns the app's real (synthesized) icon as a `gtk::Image` of the
+/// requested pixel size, falling back to a symbolic placeholder when the
+/// icon file is missing.
+///
+/// `gtk::Image::from_paintable` + `set_pixel_size(size)` is the most reliable
+/// way to size an icon in a list-row prefix: the `ActionRow` prefix area
+/// honors `set_pixel_size`, and `Image` paints the texture scaled to that
+/// size without needing extra layout passes (which `gtk::Picture` would).
 fn app_icon_at(app: &ManagedApp, size: i32) -> gtk::Widget {
     if let Some(icon) = app.icon_path.as_ref() {
         if icon.is_file() {
             if let Ok(pb) = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(icon, size, size, true) {
                 let texture = gdk::Texture::for_pixbuf(&pb);
-                let pic = gtk::Picture::new();
-                pic.set_paintable(Some(&texture));
-                pic.set_content_fit(gtk::ContentFit::Cover);
-                pic.set_size_request(size, size);
-                pic.set_can_shrink(true);
-                return pic.upcast::<gtk::Widget>();
+                let img = gtk::Image::from_paintable(Some(&texture));
+                img.set_pixel_size(size);
+                return img.upcast::<gtk::Widget>();
             }
         }
     }
