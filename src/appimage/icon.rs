@@ -11,20 +11,15 @@ use image::{ImageBuffer, ImageFormat, Rgba};
 
 use crate::error::Result;
 
-/// Libadwaita default accent blue, used when GTK is not initialized.
+/// Synthesized-icon background. v1 uses the Libadwaita default blue for
+/// stability across libadwaita versions (the dynamic `accent_color_rgba()` is
+/// only available with the `v1_6` feature, which would force a newer
+/// `libadwaita-1` at build time than every CI runner carries).
 pub const DEFAULT_ACCENT: [u8; 3] = [0x35, 0x84, 0xe4];
 
-/// Correctly rounded accent-color read from Libadwaita, else [`DEFAULT_ACCENT`].
+/// Picks the accent color for a synthesized icon. v1 always returns the
+/// Libadwaita default; v2 will read the user's accent from `StyleManager`.
 fn accent_color() -> [u8; 3] {
-    if gtk4::is_initialized() {
-        let sm = libadwaita::StyleManager::default();
-        let c = sm.accent_color_rgba();
-        return [
-            (c.red() * 255.0) as u8,
-            (c.green() * 255.0) as u8,
-            (c.blue() * 255.0) as u8,
-        ];
-    }
     DEFAULT_ACCENT
 }
 
