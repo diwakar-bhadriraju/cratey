@@ -7,13 +7,15 @@ preferring **8 jobs** locally to keep the system usable. CI uses 2.
 
 ```sh
 cargo fmt                 # formatting
-cargo clippy -- -D warnings   # lints (must be clean)
-cargo test --all-features --jobs 8
-cargo build --release --jobs 8
+cargo clippy --jobs 8 -- -D warnings   # lints (must be clean)
+cargo test --jobs 8 --all-features
+cargo build --jobs 8 --release
 ```
 
-`cargo` jobs on the CLI: always pass `--jobs 8` (or `JOBS=8`), never the
-default 12.
+`cargo` jobs on the CLI: always pass `--jobs 8` (or `JOBS=8`) **before** any
+`--` separator, because the `--` separator strips remaining args from
+Cargo and forwards them to `rustc`/`clippy-driver` (which doesn't accept
+`--jobs`). Never the default 12.
 
 ## Code style
 
@@ -42,7 +44,7 @@ repos:
         pass_filenames: false
       - id: rust-clippy
         name: clippy
-        entry: cargo clippy -- -D warnings --jobs 2
+        entry: cargo clippy --jobs 2 -- -D warnings
         language: system
         pass_filenames: false
 ```

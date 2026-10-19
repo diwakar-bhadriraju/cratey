@@ -45,10 +45,10 @@ jobs:
         run: cargo fmt --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings --jobs 2
+        run: cargo clippy --jobs 2 --all-targets -- -D warnings
 
       - name: Test
-        run: cargo test --locked --all-features --jobs 2
+        run: cargo test --jobs 2 --locked --all-features
 
       - name: Build (release)
-        run: cargo build --release --locked --jobs 2
+        run: cargo build --jobs 2 --release --locked
