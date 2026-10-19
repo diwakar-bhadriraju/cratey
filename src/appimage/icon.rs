@@ -55,7 +55,10 @@ fn to_glyph_char(c: char) -> char {
     }
 }
 
-/// Draws a single 8×8 glyph centered at the image center.
+/// Draws a single 8×8 glyph scaled to fill the central 128×128 area of the
+/// 256×256 canvas (each font pixel → 16×16 device pixels). Drawing at native
+/// 1:1 made the letter invisible at 32px display — each font pixel ended up
+/// ~0.125 device pixels.
 fn draw_letter(img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, c: char) {
     let font: &[[u8; 8]; 8] = match c {
         'A'..='Z' => FONT_AZ[c as usize - b'A' as usize],
@@ -63,13 +66,20 @@ fn draw_letter(img: &mut ImageBuffer<Rgba<u8>, Vec<u8>>, c: char) {
         _ => &FONT_Q,
     };
     let white = Rgba([255u8, 255u8, 255u8, 255u8]);
-    // Center the 8x8 glyph: 124..132.
-    for (row, line) in font.iter().enumerate() {
-        for (col, on) in line.iter().enumerate() {
+    // Each font pixel becomes a 16x16 block. Center the 128x128 glyph
+    // region:  (256 - 128) / 2 = 64, so glyph spans x=64..192, y=64..192.
+    const SCALE: u32 = 16;
+    const OFFSET: u32 = 64;
+    for (row_idx, cells) in font.iter().enumerate() {
+        for (col_idx, on) in cells.iter().enumerate() {
             if *on == 1 {
-                let x = 124 + col as u32;
-                let y = 124 + row as u32;
-                img.put_pixel(x, y, white);
+                let bx = col_idx as u32 * SCALE + OFFSET;
+                let by = row_idx as u32 * SCALE + OFFSET;
+                for dy in 0..SCALE {
+                    for dx in 0..SCALE {
+                        img.put_pixel(bx + dx, by + dy, white);
+                    }
+                }
             }
         }
     }
