@@ -907,7 +907,8 @@ impl App {
             UpdateCheckPref::OnLaunch => 1,
             UpdateCheckPref::Daily => 2,
         });
-        freq.set_subtitle("Daily checks arrive in a later release");
+        freq.set_subtitle("On launch and Daily checks are not yet implemented");
+        freq.set_sensitive(false);
         let s = sender.clone();
         freq.connect_selected_notify(move |combo| {
             s.input(AppMsg::SetUpdateCheckPref(match combo.selected() {
@@ -930,6 +931,8 @@ impl App {
             NotificationPref::Persistent => 2,
             NotificationPref::Transient => 1,
         });
+        notif_combo.set_subtitle("Notifications are not yet implemented");
+        notif_combo.set_sensitive(false);
         let s = sender.clone();
         notif_combo.connect_selected_notify(move |combo| {
             s.input(AppMsg::SetNotificationPref(match combo.selected() {
