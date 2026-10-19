@@ -14,6 +14,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Import (default mode), Updates (channel + check frequency), Notifications
   (style), and Safety (confirmation toggles) — all persisted.
 
+### Fixed / polish
+- File pickers now pass the parent window (fixes Import doing nothing on
+  Wayland, where GTK's portal-based dialog needs a parent).
+- Preferences and main windows open at a usable size.
+- App rows and the details pane show each app's real (synthesized) icon
+  instead of a generic placeholder.
+
 ## [0.1.0] - 2026-10-19
 
 Phase 1 initial release.

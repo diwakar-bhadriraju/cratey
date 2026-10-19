@@ -141,7 +141,8 @@ impl SimpleComponent for App {
         let browse = gtk::Button::with_label("Browse…");
         browse.set_halign(gtk::Align::Center);
         let s = sender.clone();
-        browse.connect_clicked(move |_| open_file_picker(s.clone()));
+        let w = root.clone();
+        browse.connect_clicked(move |_| open_file_picker(&w, s.clone()));
 
         let sidebar_info = gtk::Label::new(Some(
             "Drop AppImages here, or pick a storage directory in Preferences.",
@@ -187,15 +188,18 @@ impl SimpleComponent for App {
         header.set_title_widget(Some(&title));
 
         // Primary "Import" action.
-        let import_btn = gtk::Button::with_label("Import…");
+        let import_btn = gtk::Button::new();
+        import_btn.set_icon_name("document-open-symbolic");
+        import_btn.set_label("Import…");
         import_btn.set_tooltip_text(Some("Import an AppImage file"));
         import_btn.add_css_class("suggested-action");
         let s = sender.clone();
-        import_btn.connect_clicked(move |_| open_file_picker(s.clone()));
+        let w = root.clone();
+        import_btn.connect_clicked(move |_| open_file_picker(&w, s.clone()));
         header.pack_start(&import_btn);
 
         // Hamburger app menu.
-        let menu = build_app_menu(sender.clone());
+        let menu = build_app_menu(root.clone(), sender.clone());
         header.pack_end(&menu);
 
         let toolbar = adw::ToolbarView::new();
@@ -204,6 +208,7 @@ impl SimpleComponent for App {
 
         toast_overlay.set_child(Some(&toolbar));
         root.set_title(Some("Cratey"));
+        root.set_default_size(1160, 760);
 
         let mut model = App {
             apps,
@@ -225,7 +230,7 @@ impl SimpleComponent for App {
             sender.input(AppMsg::ShowToast(
                 "Pick a storage directory to begin".into(),
             ));
-            open_folder_picker(sender.clone());
+            open_folder_picker(&root, sender.clone());
         }
 
         ComponentParts { model, widgets: () }
@@ -384,9 +389,7 @@ impl App {
             }
             self.visible.push(i);
             let action = adw::ActionRow::new();
-            let img = gtk::Image::from_icon_name("application-x-executable-symbolic");
-            img.set_pixel_size(24);
-            action.add_prefix(&img);
+            action.add_prefix(&app_icon_at(app, 32));
             action.set_title(&app.display_name);
             action.set_subtitle(&app.installed_path.to_string_lossy());
             self.list_box.append(&action);
@@ -500,13 +503,25 @@ impl App {
         let scrolled = gtk::ScrolledWindow::new();
         scrolled.set_vexpand(true);
         scrolled.set_child(Some(&clamp));
+
+        // Header: large app icon + display name.
+        let header = gtk::Box::new(gtk::Orientation::Vertical, 6);
+        header.set_margin_top(16);
+        header.set_margin_bottom(8);
+        header.set_halign(gtk::Align::Center);
+        header.append(&app_icon_at(app, 64));
+        let name_label = gtk::Label::new(Some(&app.display_name));
+        name_label.add_css_class("title-1");
+        header.append(&name_label);
+
+        self.details_box.append(&header);
         self.details_box.append(&scrolled);
     }
 
     fn import_files(&mut self, paths: Vec<PathBuf>, sender: &ComponentSender<Self>) {
         if self.settings.base_dir.is_none() {
             self.toast("Choose a storage directory first");
-            open_folder_picker(sender.clone());
+            open_folder_picker(&self.root, sender.clone());
             return;
         }
         for path in paths {
@@ -730,6 +745,7 @@ impl App {
 
     fn show_preferences_window(&self, sender: &ComponentSender<Self>) {
         let dialog = adw::PreferencesDialog::new();
+        dialog.set_content_width(540);
         // Local helper: a ComboRow with a label list.
         let mkcombo = |title: &str, options: &[&str]| -> adw::ComboRow {
             let combo = adw::ComboRow::new();
@@ -764,7 +780,8 @@ impl App {
 
         let change = gtk::Button::with_label("Change…");
         let s = sender.clone();
-        change.connect_clicked(move |_| open_folder_picker(s.clone()));
+        let w = self.root.clone();
+        change.connect_clicked(move |_| open_folder_picker(&w, s.clone()));
         btn_row.append(&change);
 
         let open = gtk::Button::with_label("Open");
@@ -912,6 +929,24 @@ fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: &str) {
     group.add(&row);
 }
 
+/// Returns the app's real (synthesized) icon scaled to `size` px, falling back
+/// to a symbolic placeholder when the icon file is missing.
+fn app_icon_at(app: &ManagedApp, size: i32) -> gtk::Image {
+    if let Some(icon) = app.icon_path.as_ref() {
+        if icon.is_file() {
+            if let Ok(pb) = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(icon, size, size, true) {
+                let texture = gdk::Texture::for_pixbuf(&pb);
+                let img = gtk::Image::from_paintable(Some(&texture));
+                img.set_pixel_size(size);
+                return img;
+            }
+        }
+    }
+    let img = gtk::Image::from_icon_name("application-x-executable-symbolic");
+    img.set_pixel_size(size);
+    img
+}
+
 fn update_status_text(s: &UpdateStatus) -> String {
     match s {
         UpdateStatus::Unknown => "Unknown".into(),
@@ -962,41 +997,33 @@ fn open_in_file_manager(path: &std::path::Path) {
     }
 }
 
-fn open_file_picker(sender: ComponentSender<App>) {
+fn open_file_picker(parent: &impl IsA<gtk::Window>, sender: ComponentSender<App>) {
     let dialog = gtk::FileDialog::builder()
         .title("Choose AppImage file")
         .modal(true)
         .build();
     let s = sender.clone();
-    dialog.open(
-        None::<&gtk::Window>,
-        None::<&gtk::gio::Cancellable>,
-        move |res| {
-            if let Ok(file) = res {
-                if let Some(p) = file.path() {
-                    s.input(AppMsg::ImportFiles(vec![p]));
-                }
+    dialog.open(Some(parent), None::<&gtk::gio::Cancellable>, move |res| {
+        if let Ok(file) = res {
+            if let Some(p) = file.path() {
+                s.input(AppMsg::ImportFiles(vec![p]));
             }
-        },
-    );
+        }
+    });
 }
 
-fn open_folder_picker(sender: ComponentSender<App>) {
+fn open_folder_picker(parent: &impl IsA<gtk::Window>, sender: ComponentSender<App>) {
     let dialog = gtk::FileDialog::builder()
         .title("Choose AppImage storage directory")
         .modal(true)
         .build();
-    dialog.select_folder(
-        None::<&gtk::Window>,
-        None::<&gtk::gio::Cancellable>,
-        move |res| {
-            if let Ok(file) = res {
-                if let Some(p) = file.path() {
-                    sender.input(AppMsg::SetBaseDir(p));
-                }
+    dialog.select_folder(Some(parent), None::<&gtk::gio::Cancellable>, move |res| {
+        if let Ok(file) = res {
+            if let Some(p) = file.path() {
+                sender.input(AppMsg::SetBaseDir(p));
             }
-        },
-    );
+        }
+    });
 }
 
 fn prompt_rename(current: String, sender: ComponentSender<App>) {
@@ -1037,7 +1064,7 @@ fn prompt_rename(current: String, sender: ComponentSender<App>) {
 }
 
 /// Builds the hamburger app menu (Import / Preferences / About / Quit).
-fn build_app_menu(sender: ComponentSender<App>) -> gtk::MenuButton {
+fn build_app_menu(parent: adw::Window, sender: ComponentSender<App>) -> gtk::MenuButton {
     let btn = gtk::MenuButton::new();
     btn.set_icon_name("open-menu-symbolic");
     btn.set_tooltip_text(Some("Menu"));
@@ -1059,8 +1086,9 @@ fn build_app_menu(sender: ComponentSender<App>) -> gtk::MenuButton {
     let import = mk("Import AppImage…");
     let s = sender.clone();
     let p = pop.clone();
+    let w = parent.clone();
     import.connect_clicked(move |_| {
-        open_file_picker(s.clone());
+        open_file_picker(&w, s.clone());
         p.popdown();
     });
     list.append(&import);
