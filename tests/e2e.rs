@@ -98,7 +98,7 @@ impl TestEnv {
             installed_path: installed,
             icon_path: cratey::paths::icons_dir().join(format!("{id}.png")),
             desktop_file_path: cratey::paths::applications_dir()
-                .join(cratey::model::desktop_file_basename(&id)),
+                .join(cratey::model::desktop_file_basename(&id, display)),
             base_dir: Some(self.base.clone()),
             move_source: mode == ImportMode::Move,
         }

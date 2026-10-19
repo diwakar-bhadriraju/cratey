@@ -111,7 +111,10 @@ fn build_app(planned: &PlannedInstall, desktop_path: std::path::PathBuf) -> Mana
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         installed_path: planned.installed_path.clone(),
-        desktop_file_basename: crate::model::desktop_file_basename(&planned.id),
+        desktop_file_basename: crate::model::desktop_file_basename(
+            &planned.id,
+            &planned.display_name,
+        ),
         desktop_file_path: desktop_path,
         icon_path: Some(planned.icon_path.clone()),
         imported_at: Utc::now(),
@@ -208,7 +211,8 @@ pub fn register_existing(source_path: &Path, display_name: &str) -> Result<Manag
     chmod_exec(&installed)?;
 
     let icon = crate::paths::icons_dir().join(format!("{id}.png"));
-    let desktop = crate::paths::applications_dir().join(crate::model::desktop_file_basename(&id));
+    let desktop = crate::paths::applications_dir()
+        .join(crate::model::desktop_file_basename(&id, display_name));
 
     // Synthesize the icon.
     synthesize_icon(display_name, &icon)?;
@@ -265,7 +269,7 @@ pub fn register_existing(source_path: &Path, display_name: &str) -> Result<Manag
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         installed_path: installed.clone(),
-        desktop_file_basename: crate::model::desktop_file_basename(&id),
+        desktop_file_basename: crate::model::desktop_file_basename(&id, display_name),
         desktop_file_path: desktop_path,
         icon_path: Some(icon.clone()),
         imported_at: Utc::now(),

@@ -245,9 +245,12 @@ impl SimpleComponent for App {
         match msg {
             AppMsg::Refresh => self.rebuild_all(&sender),
             AppMsg::Select(pos) => {
-                if let Some(real) = self.visible.get(pos) {
-                    self.selected = Some(*real);
-                    self.rebuild_all(&sender);
+                // Selection only swaps the right pane. The list is
+                // untouched so icons aren't re-decoded from disk on every
+                // click — that was the source of the multi-second hang.
+                if let Some(real) = self.visible.get(pos).copied() {
+                    self.selected = Some(real);
+                    self.rebuild_details(&sender);
                 }
             }
             AppMsg::ImportFiles(paths) => self.import_files(paths, &sender),
@@ -258,7 +261,9 @@ impl SimpleComponent for App {
                 mode,
             } => {
                 self.do_install(source, base_dir, display, mode, &sender);
-                sender.input(AppMsg::Refresh);
+                // A new app was added (or nothing) — rebuild just the list.
+                self.rebuild_list();
+                self.rebuild_details(&sender);
                 self.show_next_preview(&sender);
             }
             AppMsg::Launch => {
@@ -279,7 +284,9 @@ impl SimpleComponent for App {
                     if !name.trim().is_empty() {
                         self.apps[idx].display_name = name.trim().to_string();
                         self.commit_state();
-                        sender.input(AppMsg::Refresh);
+                        // The row's title changes; redraw just the list.
+                        self.rebuild_list();
+                        self.rebuild_details(&sender);
                     }
                 }
             }
@@ -289,7 +296,10 @@ impl SimpleComponent for App {
                         Ok(()) => self.toast("Integration repaired"),
                         Err(e) => self.toast(format!("Repair failed: {e}")),
                     }
-                    sender.input(AppMsg::Refresh);
+                    // Repair regenerated icon/desktop; rebuild the row +
+                    // reopen details so the new icon paints.
+                    self.rebuild_list();
+                    self.rebuild_details(&sender);
                 }
             }
             AppMsg::Uninstall => self.confirm_uninstall(&sender),
@@ -303,7 +313,8 @@ impl SimpleComponent for App {
                 self.settings.base_dir = Some(dir);
                 self.commit_settings();
                 self.toast("Storage directory set");
-                sender.input(AppMsg::Refresh);
+                self.rebuild_list();
+                self.rebuild_details(&sender);
             }
             AppMsg::SetImportMode(m) => {
                 self.settings.default_import_mode = m;
@@ -335,7 +346,8 @@ impl SimpleComponent for App {
                 self.selected = None;
                 self.apps.retain(|a| a.id != id);
                 self.commit_state();
-                sender.input(AppMsg::Refresh);
+                self.rebuild_list();
+                self.rebuild_details(&sender);
             }
             AppMsg::Rescan => {
                 // Find AppImages in the storage dir that aren't already
@@ -380,7 +392,8 @@ impl SimpleComponent for App {
                         }
                     }
                     self.toast(msg);
-                    sender.input(AppMsg::Refresh);
+                    self.rebuild_list();
+                    self.rebuild_details(&sender);
                 } else {
                     self.toast("No storage directory set");
                 }
@@ -389,7 +402,8 @@ impl SimpleComponent for App {
             AppMsg::Quit => self.root.close(),
             AppMsg::SearchChanged(s) => {
                 self.search_text = s;
-                self.rebuild_all(&sender);
+                // Search only filters the list; details stay.
+                self.rebuild_list();
             }
             AppMsg::ShowToast(text) => self.toast(text),
             AppMsg::ClosePreview => self.show_next_preview(&sender),
@@ -423,6 +437,15 @@ impl App {
     }
 
     fn rebuild_all(&mut self, sender: &ComponentSender<Self>) {
+        self.rebuild_list();
+        self.rebuild_details(sender);
+    }
+
+    /// Rebuilds ONLY the list rows (the left pane). No icon/texture relayout
+    /// for the details; no scroll position reset on the right. Used after any
+    /// change to the *set* or *order* of apps (install / uninstall / rescan /
+    /// rename / base_dir change).
+    fn rebuild_list(&mut self) {
         self.clear_list();
         self.suppress_selected.set(true);
         let query = self.search_text.to_lowercase();
@@ -447,8 +470,6 @@ impl App {
         self.suppress_selected.set(false);
         self.list_box.set_visible(!self.apps.is_empty());
         self.sidebar_info.set_visible(self.apps.is_empty());
-
-        self.rebuild_details(sender);
     }
 
     fn rebuild_details(&mut self, sender: &ComponentSender<Self>) {
@@ -721,7 +742,8 @@ impl App {
                 .unwrap_or_else(|| "app.AppImage".into()),
         );
         let icon = paths::icons_dir().join(format!("{id}.png"));
-        let desktop = paths::applications_dir().join(crate::model::desktop_file_basename(&id));
+        let desktop =
+            paths::applications_dir().join(crate::model::desktop_file_basename(&id, &display));
         let plan = PlannedInstall {
             id: id.clone(),
             display_name: display,
@@ -1032,20 +1054,23 @@ fn add_info_row(group: &adw::PreferencesGroup, title: &str, subtitle: &str) {
 
 /// Returns the app's real (synthesized) icon scaled to `size` px, falling back
 /// to a symbolic placeholder when the icon file is missing.
-fn app_icon_at(app: &ManagedApp, size: i32) -> gtk::Image {
+fn app_icon_at(app: &ManagedApp, size: i32) -> gtk::Widget {
     if let Some(icon) = app.icon_path.as_ref() {
         if icon.is_file() {
             if let Ok(pb) = gtk::gdk_pixbuf::Pixbuf::from_file_at_scale(icon, size, size, true) {
                 let texture = gdk::Texture::for_pixbuf(&pb);
-                let img = gtk::Image::from_paintable(Some(&texture));
-                img.set_pixel_size(size);
-                return img;
+                let pic = gtk::Picture::new();
+                pic.set_paintable(Some(&texture));
+                pic.set_content_fit(gtk::ContentFit::Cover);
+                pic.set_size_request(size, size);
+                pic.set_can_shrink(true);
+                return pic.upcast::<gtk::Widget>();
             }
         }
     }
     let img = gtk::Image::from_icon_name("application-x-executable-symbolic");
     img.set_pixel_size(size);
-    img
+    img.upcast::<gtk::Widget>()
 }
 
 fn update_status_text(s: &UpdateStatus) -> String {

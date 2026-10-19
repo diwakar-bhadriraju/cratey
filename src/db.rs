@@ -125,7 +125,10 @@ mod tests {
             display_name: name.to_string(),
             source_filename: format!("{name}.AppImage"),
             installed_path: std::path::PathBuf::from(format!("/tmp/{name}.AppImage")),
-            desktop_file_basename: crate::model::desktop_file_basename(&crate::model::new_app_id()),
+            desktop_file_basename: crate::model::desktop_file_basename(
+                &crate::model::new_app_id(),
+                name,
+            ),
             desktop_file_path: std::path::PathBuf::from("/tmp/a.desktop"),
             icon_path: None,
             imported_at: chrono::Utc::now(),

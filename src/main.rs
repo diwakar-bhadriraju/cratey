@@ -72,12 +72,12 @@ fn headless_import(source: &std::path::Path) -> Result<cratey::model::ManagedApp
         .unwrap_or_else(|| "Untitled App".into());
     let plan = cratey::integration::PlannedInstall {
         id: id.clone(),
-        display_name: display,
+        display_name: display.clone(),
         source_path: source.to_path_buf(),
         installed_path: installed,
         icon_path: cratey::paths::icons_dir().join(format!("{id}.png")),
         desktop_file_path: cratey::paths::applications_dir()
-            .join(cratey::model::desktop_file_basename(&id)),
+            .join(cratey::model::desktop_file_basename(&id, &display)),
         base_dir: Some(base_dir),
         move_source: false,
     };
