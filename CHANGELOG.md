@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Richer window: header bar with an Import button and a hamburger app menu
+  (Import / Preferences / About / Quit).
+- Full multi-page Preferences dialog: Storage (change/open/rescan directory),
+  Import (default mode), Updates (channel + check frequency), Notifications
+  (style), and Safety (confirmation toggles) — all persisted.
+
 ## [0.1.0] - 2026-10-19
 
 Phase 1 initial release.

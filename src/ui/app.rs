@@ -15,7 +15,8 @@ use crate::db::Db;
 use crate::error::Result;
 use crate::integration::PlannedInstall;
 use crate::model::{
-    ImportMode, IntegrationStatus, ManagedApp, Settings, UpdateProvider, UpdateStatus,
+    ImportMode, IntegrationStatus, ManagedApp, NotificationPref, ReleaseChannel, Settings,
+    UpdateCheckPref, UpdateProvider, UpdateStatus,
 };
 use crate::paths;
 use crate::update::UpdateProvider as _;
@@ -58,6 +59,14 @@ pub enum AppMsg {
     Preferences,
     SetBaseDir(PathBuf),
     SetImportMode(ImportMode),
+    SetReleaseChannel(ReleaseChannel),
+    SetUpdateCheckPref(UpdateCheckPref),
+    SetNotificationPref(NotificationPref),
+    SetConfirmInstall(bool),
+    SetConfirmUninstall(bool),
+    Rescan,
+    About,
+    Quit,
     SearchChanged(String),
     ShowToast(String),
     ClosePreview,
@@ -163,7 +172,30 @@ impl SimpleComponent for App {
         split.set_sidebar(Some(&sidebar));
         split.set_content(Some(&details_stack));
 
-        toast_overlay.set_child(Some(&split));
+        // --- Header bar + app menu ---
+        let header = adw::HeaderBar::new();
+
+        let title = gtk::Label::new(Some("Cratey"));
+        title.add_css_class("title");
+        header.set_title_widget(Some(&title));
+
+        // Primary "Import" action.
+        let import_btn = gtk::Button::with_label("Import…");
+        import_btn.set_tooltip_text(Some("Import an AppImage file"));
+        import_btn.add_css_class("suggested-action");
+        let s = sender.clone();
+        import_btn.connect_clicked(move |_| open_file_picker(s.clone()));
+        header.pack_start(&import_btn);
+
+        // Hamburger app menu.
+        let menu = build_app_menu(sender.clone());
+        header.pack_end(&menu);
+
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&header);
+        toolbar.set_content(Some(&split));
+
+        toast_overlay.set_child(Some(&toolbar));
         root.set_title(Some("Cratey"));
 
         let mut model = App {
@@ -182,7 +214,10 @@ impl SimpleComponent for App {
         model.rebuild_all(&sender);
 
         if model.settings.base_dir.is_none() {
-            sender.input(AppMsg::Preferences);
+            sender.input(AppMsg::ShowToast(
+                "Pick a storage directory to begin".into(),
+            ));
+            open_folder_picker(sender.clone());
         }
 
         ComponentParts { model, widgets: () }
@@ -244,13 +279,7 @@ impl SimpleComponent for App {
                     self.check_updates(app.clone(), &sender);
                 }
             }
-            AppMsg::Preferences => {
-                if self.settings.base_dir.is_none() {
-                    open_folder_picker(sender.clone());
-                } else {
-                    self.show_preferences_window();
-                }
-            }
+            AppMsg::Preferences => self.show_preferences_window(&sender),
             AppMsg::SetBaseDir(dir) => {
                 self.settings.base_dir = Some(dir);
                 self.commit_settings();
@@ -261,6 +290,43 @@ impl SimpleComponent for App {
                 self.settings.default_import_mode = m;
                 self.commit_settings();
             }
+            AppMsg::SetReleaseChannel(c) => {
+                self.settings.release_channel_default = c;
+                self.commit_settings();
+            }
+            AppMsg::SetUpdateCheckPref(p) => {
+                self.settings.update_check_pref = p;
+                self.commit_settings();
+            }
+            AppMsg::SetNotificationPref(p) => {
+                self.settings.notification_pref = p;
+                self.commit_settings();
+            }
+            AppMsg::SetConfirmInstall(v) => {
+                self.settings.confirm_before_install = v;
+                self.commit_settings();
+            }
+            AppMsg::SetConfirmUninstall(v) => {
+                self.settings.confirm_before_uninstall = v;
+                self.commit_settings();
+            }
+            AppMsg::Rescan => {
+                // Re-list AppImages already present in the storage dir.
+                if let Some(base) = &self.settings.base_dir {
+                    let found = crate::appimage::scan::scan_dir(base);
+                    if found.is_empty() {
+                        self.toast("No AppImages found in the storage directory");
+                    } else {
+                        self.toast(format!("Found {} AppImage(s) (import to add)", found.len()));
+                    }
+                    let _ = found;
+                } else {
+                    self.toast("No storage directory set");
+                }
+                sender.input(AppMsg::Refresh);
+            }
+            AppMsg::About => show_about(&self.root),
+            AppMsg::Quit => self.root.close(),
             AppMsg::SearchChanged(s) => {
                 self.search_text = s;
                 self.rebuild_all(&sender);
@@ -644,16 +710,27 @@ impl App {
         );
     }
 
-    fn show_preferences_window(&self) {
+    fn show_preferences_window(&self, sender: &ComponentSender<Self>) {
         let dialog = adw::PreferencesDialog::new();
+        // Local helper: a ComboRow with a label list.
+        let mkcombo = |title: &str, options: &[&str]| -> adw::ComboRow {
+            let combo = adw::ComboRow::new();
+            combo.set_title(title);
+            let list = gtk::StringList::new(options);
+            combo.set_model(Some(&list));
+            combo
+        };
 
+        // ---- Storage ----
         let storage = adw::PreferencesPage::new();
         storage.set_title("Storage");
         let group = adw::PreferencesGroup::new();
         group.set_title("Storage directory");
-        let row = adw::ActionRow::new();
-        row.set_title("Directory");
-        row.set_subtitle(
+        group.set_description(Some("AppImages are copied here when you install them."));
+
+        let dir_row = adw::ActionRow::new();
+        dir_row.set_title("Directory");
+        dir_row.set_subtitle(
             self.settings
                 .base_dir
                 .as_ref()
@@ -661,10 +738,149 @@ impl App {
                 .unwrap_or_else(|| "Not set".into())
                 .as_str(),
         );
-        group.add(&row);
-        storage.add(&group);
-        dialog.add(&storage);
+        group.add(&dir_row);
 
+        let btn_row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        btn_row.set_halign(gtk::Align::Start);
+        btn_row.set_margin_top(6);
+
+        let change = gtk::Button::with_label("Change…");
+        let s = sender.clone();
+        change.connect_clicked(move |_| open_folder_picker(s.clone()));
+        btn_row.append(&change);
+
+        let open = gtk::Button::with_label("Open");
+        let s = sender.clone();
+        let base = self.settings.base_dir.clone();
+        open.connect_clicked(move |_| {
+            if let Some(dir) = &base {
+                open_in_file_manager(dir);
+            } else {
+                s.input(AppMsg::ShowToast("No storage directory set".into()));
+            }
+        });
+        btn_row.append(&open);
+
+        let rescan = gtk::Button::with_label("Rescan");
+        let s = sender.clone();
+        rescan.connect_clicked(move |_| s.input(AppMsg::Rescan));
+        btn_row.append(&rescan);
+
+        group.add(&btn_row);
+        storage.add(&group);
+
+        // ---- Import ----
+        let import = adw::PreferencesPage::new();
+        import.set_title("Import");
+        let igroup = adw::PreferencesGroup::new();
+        igroup.set_title("Import behaviour");
+        let mode = mkcombo("Default import mode", &["Copy", "Move"]);
+        mode.set_selected(if self.settings.default_import_mode == ImportMode::Move {
+            1
+        } else {
+            0
+        });
+        let s = sender.clone();
+        mode.connect_selected_notify(move |combo| {
+            s.input(AppMsg::SetImportMode(if combo.selected() == 1 {
+                ImportMode::Move
+            } else {
+                ImportMode::Copy
+            }));
+        });
+        igroup.add(&mode);
+        import.add(&igroup);
+
+        // ---- Updates ----
+        let updates = adw::PreferencesPage::new();
+        updates.set_title("Updates");
+        let ugroup = adw::PreferencesGroup::new();
+        ugroup.set_title("Update checks");
+
+        let channel = mkcombo("Release channel", &["Stable", "Prerelease"]);
+        channel.set_selected(
+            if self.settings.release_channel_default == ReleaseChannel::Prerelease {
+                1
+            } else {
+                0
+            },
+        );
+        let s = sender.clone();
+        channel.connect_selected_notify(move |combo| {
+            s.input(AppMsg::SetReleaseChannel(if combo.selected() == 1 {
+                ReleaseChannel::Prerelease
+            } else {
+                ReleaseChannel::Stable
+            }));
+        });
+        ugroup.add(&channel);
+
+        let freq = mkcombo("Check frequency", &["Manual", "On launch", "Daily"]);
+        freq.set_selected(match self.settings.update_check_pref {
+            UpdateCheckPref::Manual => 0,
+            UpdateCheckPref::OnLaunch => 1,
+            UpdateCheckPref::Daily => 2,
+        });
+        freq.set_subtitle("Daily checks arrive in a later release");
+        let s = sender.clone();
+        freq.connect_selected_notify(move |combo| {
+            s.input(AppMsg::SetUpdateCheckPref(match combo.selected() {
+                1 => UpdateCheckPref::OnLaunch,
+                2 => UpdateCheckPref::Daily,
+                _ => UpdateCheckPref::Manual,
+            }));
+        });
+        ugroup.add(&freq);
+        updates.add(&ugroup);
+
+        // ---- Notifications ----
+        let notif = adw::PreferencesPage::new();
+        notif.set_title("Notifications");
+        let ng = adw::PreferencesGroup::new();
+        ng.set_title("Notification style");
+        let notif_combo = mkcombo("Style", &["Disabled", "Transient", "Persistent"]);
+        notif_combo.set_selected(match self.settings.notification_pref {
+            NotificationPref::Disabled => 0,
+            NotificationPref::Persistent => 2,
+            NotificationPref::Transient => 1,
+        });
+        let s = sender.clone();
+        notif_combo.connect_selected_notify(move |combo| {
+            s.input(AppMsg::SetNotificationPref(match combo.selected() {
+                0 => NotificationPref::Disabled,
+                2 => NotificationPref::Persistent,
+                _ => NotificationPref::Transient,
+            }));
+        });
+        ng.add(&notif_combo);
+        notif.add(&ng);
+
+        // ---- Safety ----
+        let safety = adw::PreferencesPage::new();
+        safety.set_title("Safety");
+        let sg = adw::PreferencesGroup::new();
+        sg.set_title("Confirmations");
+
+        let cfgi = adw::SwitchRow::new();
+        cfgi.set_title("Confirm before installing");
+        cfgi.set_active(self.settings.confirm_before_install);
+        let s = sender.clone();
+        cfgi.connect_active_notify(move |sw| s.input(AppMsg::SetConfirmInstall(sw.is_active())));
+        sg.add(&cfgi);
+
+        let cfgu = adw::SwitchRow::new();
+        cfgu.set_title("Confirm before uninstalling");
+        cfgu.set_active(self.settings.confirm_before_uninstall);
+        let s = sender.clone();
+        cfgu.connect_active_notify(move |sw| s.input(AppMsg::SetConfirmUninstall(sw.is_active())));
+        sg.add(&cfgu);
+        safety.add(&sg);
+
+        dialog.add(&storage);
+        dialog.add(&import);
+        dialog.add(&updates);
+        dialog.add(&notif);
+        dialog.add(&safety);
         dialog.present(Some(&self.root));
     }
 }
@@ -800,4 +1016,76 @@ fn prompt_rename(current: String, sender: ComponentSender<App>) {
     tbv.set_content(Some(&body));
     window.set_content(Some(&tbv));
     window.present();
+}
+
+/// Builds the hamburger app menu (Import / Preferences / About / Quit).
+fn build_app_menu(sender: ComponentSender<App>) -> gtk::MenuButton {
+    let btn = gtk::MenuButton::new();
+    btn.set_icon_name("open-menu-symbolic");
+    btn.set_tooltip_text(Some("Menu"));
+
+    let pop = gtk::Popover::new();
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    list.set_margin_top(6);
+    list.set_margin_bottom(6);
+    list.set_margin_start(6);
+    list.set_margin_end(6);
+
+    let mk = |label: &str| -> gtk::Button {
+        let b = gtk::Button::with_label(label);
+        b.set_halign(gtk::Align::Start);
+        b.add_css_class("flat");
+        b
+    };
+
+    let import = mk("Import AppImage…");
+    let s = sender.clone();
+    let p = pop.clone();
+    import.connect_clicked(move |_| {
+        open_file_picker(s.clone());
+        p.popdown();
+    });
+    list.append(&import);
+
+    let prefs = mk("Preferences…");
+    let s = sender.clone();
+    let p = pop.clone();
+    prefs.connect_clicked(move |_| {
+        s.input(AppMsg::Preferences);
+        p.popdown();
+    });
+    list.append(&prefs);
+
+    let about = mk("About Cratey");
+    let s = sender.clone();
+    let p = pop.clone();
+    about.connect_clicked(move |_| {
+        s.input(AppMsg::About);
+        p.popdown();
+    });
+    list.append(&about);
+
+    let quit = mk("Quit");
+    let s = sender.clone();
+    let p = pop.clone();
+    quit.connect_clicked(move |_| {
+        s.input(AppMsg::Quit);
+        p.popdown();
+    });
+    list.append(&quit);
+
+    pop.set_child(Some(&list));
+    btn.set_popover(Some(&pop));
+    btn
+}
+
+/// Shows the About dialog.
+fn show_about(parent: &adw::Window) {
+    let about = adw::AboutDialog::new();
+    about.set_application_name("Cratey");
+    about.set_version(env!("CARGO_PKG_VERSION"));
+    about.set_developer_name("Diwakar Bhadriraju");
+    about.set_license_type(gtk::License::MitX11);
+    about.set_comments("Native Linux AppImage manager");
+    about.present(Some(parent));
 }
