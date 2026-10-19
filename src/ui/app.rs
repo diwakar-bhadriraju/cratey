@@ -39,6 +39,8 @@ pub struct App {
     visible: Vec<usize>,
     /// While true, the row-selected handler ignores events (programmatic rebuild).
     suppress_selected: std::rc::Rc<std::cell::Cell<bool>>,
+    /// Files still waiting for their import-preview dialog (dir imports / drops).
+    pending_imports: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +225,7 @@ impl SimpleComponent for App {
             toast_overlay,
             visible: Vec::new(),
             suppress_selected: suppress,
+            pending_imports: Vec::new(),
         };
         model.rebuild_all(&sender);
 
@@ -254,6 +257,7 @@ impl SimpleComponent for App {
             } => {
                 self.do_install(source, base_dir, display, mode, &sender);
                 sender.input(AppMsg::Refresh);
+                self.show_next_preview(&sender);
             }
             AppMsg::Launch => {
                 if let Some(app) = self.selected_app() {
@@ -345,7 +349,7 @@ impl SimpleComponent for App {
                 self.rebuild_all(&sender);
             }
             AppMsg::ShowToast(text) => self.toast(text),
-            AppMsg::ClosePreview => {}
+            AppMsg::ClosePreview => self.show_next_preview(&sender),
         }
     }
 }
@@ -443,56 +447,62 @@ impl App {
         let act_group = adw::PreferencesGroup::new();
         act_group.set_title("Actions");
 
-        let launch = gtk::Button::with_label("Launch");
-        launch.set_halign(gtk::Align::Start);
-        launch.add_css_class("suggested-action");
+        let launch = adw::ActionRow::new();
+        launch.set_title("Launch");
+        launch.set_activatable(true);
         {
             let s = sender.clone();
-            launch.connect_clicked(move |_| s.input(AppMsg::Launch));
+            launch.connect_activated(move |_| s.input(AppMsg::Launch));
         }
         act_group.add(&launch);
 
-        let open = gtk::Button::with_label("Open location");
-        open.set_halign(gtk::Align::Start);
+        let open = adw::ActionRow::new();
+        open.set_title("Open location");
+        open.set_activatable(true);
         {
             let s = sender.clone();
-            open.connect_clicked(move |_| s.input(AppMsg::OpenLocation));
+            open.connect_activated(move |_| s.input(AppMsg::OpenLocation));
         }
         act_group.add(&open);
 
-        let rename = gtk::Button::with_label("Rename…");
-        rename.set_halign(gtk::Align::Start);
+        let rename = adw::ActionRow::new();
+        rename.set_title("Rename…");
+        rename.set_activatable(true);
         {
             let s = sender.clone();
             let current = app.display_name.clone();
-            rename.connect_clicked(move |_| prompt_rename(current.clone(), s.clone()));
+            rename.connect_activated(move |_| prompt_rename(current.clone(), s.clone()));
         }
         act_group.add(&rename);
 
         if matches!(app.integration_status, IntegrationStatus::Healthy) {
-            let check = gtk::Button::with_label("Check for updates");
-            check.set_halign(gtk::Align::Start);
+            let check = adw::ActionRow::new();
+            check.set_title("Check for updates");
+            check.set_subtitle("Queries the configured update source");
+            check.set_activatable(true);
             {
                 let s = sender.clone();
-                check.connect_clicked(move |_| s.input(AppMsg::CheckUpdates));
+                check.connect_activated(move |_| s.input(AppMsg::CheckUpdates));
             }
             act_group.add(&check);
         } else {
-            let repair = gtk::Button::with_label("Repair integration");
-            repair.set_halign(gtk::Align::Start);
+            let repair = adw::ActionRow::new();
+            repair.set_title("Repair integration");
+            repair.set_activatable(true);
             {
                 let s = sender.clone();
-                repair.connect_clicked(move |_| s.input(AppMsg::Repair));
+                repair.connect_activated(move |_| s.input(AppMsg::Repair));
             }
             act_group.add(&repair);
         }
 
-        let uninstall = gtk::Button::with_label("Uninstall…");
-        uninstall.set_halign(gtk::Align::Start);
-        uninstall.add_css_class("destructive-action");
+        let uninstall = adw::ActionRow::new();
+        uninstall.set_title("Uninstall…");
+        uninstall.set_subtitle("Remove integration and/or the binary");
+        uninstall.set_activatable(true);
         {
             let s = sender.clone();
-            uninstall.connect_clicked(move |_| s.input(AppMsg::Uninstall));
+            uninstall.connect_activated(move |_| s.input(AppMsg::Uninstall));
         }
         act_group.add(&uninstall);
 
@@ -525,10 +535,51 @@ impl App {
             return;
         }
         for path in paths {
-            match crate::appimage::format::detect(&path) {
-                Ok(_) => self.show_preview(path, sender),
-                Err(e) => self.toast(format!("Not a valid AppImage: {e}")),
+            if path.is_dir() {
+                // Importing a folder: scan it for AppImages (recursively).
+                let found = crate::appimage::scan::scan_dir(&path);
+                if found.is_empty() {
+                    self.toast(format!("No AppImages found in {}", path.display()));
+                }
+                for f in found {
+                    self.enqueue_import(f);
+                }
+            } else if path.is_file() {
+                self.enqueue_import(path);
+            } else {
+                self.toast(format!("Not found: {}", path.display()));
             }
+        }
+        self.show_next_preview(sender);
+    }
+
+    /// Validates a single file and queues it for the preview dialog, skipping
+    /// files already installed to the same target to avoid duplicates.
+    fn enqueue_import(&mut self, path: PathBuf) {
+        if let Err(e) = crate::appimage::format::detect(&path) {
+            self.toast(format!("{}: not a valid AppImage ({e})", path.display()));
+            return;
+        }
+        let target = self
+            .settings
+            .base_dir
+            .as_ref()
+            .map(|b| b.join(path.file_name().unwrap_or_default()));
+        if let Some(t) = &target {
+            if self.apps.iter().any(|a| &a.installed_path == t) {
+                self.toast(format!("{} already installed", path.display()));
+                return;
+            }
+        }
+        self.pending_imports.push(path);
+    }
+
+    /// Opens the preview for the next queued file, if any.
+    fn show_next_preview(&mut self, sender: &ComponentSender<Self>) {
+        if let Some(path) = self.pending_imports.first() {
+            let path = path.clone();
+            self.pending_imports.remove(0);
+            self.show_preview(path, sender);
         }
     }
 
@@ -745,7 +796,7 @@ impl App {
 
     fn show_preferences_window(&self, sender: &ComponentSender<Self>) {
         let dialog = adw::PreferencesDialog::new();
-        dialog.set_content_width(540);
+        dialog.set_content_width(620);
         // Local helper: a ComboRow with a label list.
         let mkcombo = |title: &str, options: &[&str]| -> adw::ComboRow {
             let combo = adw::ComboRow::new();
@@ -978,9 +1029,13 @@ fn repair_app(app: &ManagedApp) -> Result<()> {
 fn load_state() -> (Vec<ManagedApp>, Settings) {
     match Db::open() {
         Ok(db) => {
-            let apps = db.apps().to_vec();
+            let mut apps = db.apps().to_vec();
             let settings = db.document().settings.clone();
             drop(db);
+            // Dedup by installed path (keep the first entry) so a previously
+            // re-imported AppImage doesn't surface twice.
+            let mut seen = std::collections::HashSet::new();
+            apps.retain(|a| seen.insert(a.installed_path.clone()));
             (apps, settings)
         }
         Err(_) => (Vec::new(), Settings::default()),

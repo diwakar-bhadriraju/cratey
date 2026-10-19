@@ -20,6 +20,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Preferences and main windows open at a usable size.
 - App rows and the details pane show each app's real (synthesized) icon
   instead of a generic placeholder.
+- Details actions are proper `adw::ActionRow` rows (plain `gtk::Button`
+  children of a `PreferencesGroup` didn't lay out or activate reliably).
+- Importing a folder (drag or picker) now scans it recursively for AppImages,
+  imports them through the preview queue, and skips files already installed —
+  no more duplicates. Existing duplicate entries are collapsed on launch.
+- Imported files are processed one preview at a time (queued).
 
 ## [0.1.0] - 2026-10-19
 
