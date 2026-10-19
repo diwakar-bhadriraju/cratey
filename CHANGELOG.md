@@ -27,6 +27,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   no more duplicates. Existing duplicate entries are collapsed on launch.
 - Imported files are processed one preview at a time (queued).
 
+### Fixed (v0.1.x polish)
+- `.desktop` filenames are now human-readable (`crate-<slug>-<id>.desktop`).
+- Icons load reliably: `gtk::Picture` honors `set_paintable` + size.
+- Row selection no longer rebuilds the list — click-to-click is instant.
+- `launch()` passes through session env so AppImages that need
+  `WAYLAND_DISPLAY`/`XDG_RUNTIME_DIR`/`DBUS_*` actually start.
+- Updates download to disk in 5 MiB chunks (no full 2 GiB in RAM).
+- A corrupted `apps.json` is moved to `apps.corrupt-<timestamp>.json`
+  before the app starts (with a toast) instead of silently losing data.
+- A failed `chmod` after an update surfaces as an error rather than a
+  silently non-executable binary.
+
 ## [0.1.0] - 2026-10-19
 
 Phase 1 initial release.

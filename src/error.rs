@@ -13,6 +13,8 @@ pub enum AppError {
     Update(String),
     #[error("AppImage error: {0}")]
     AppImage(String),
+    #[error("The database file was corrupted; a backup was written to {path}. The app is starting with an empty library. Recover manually from the backup, then restart.")]
+    DatabaseCorrupted { path: std::path::PathBuf },
 }
 
 /// Convenience result alias. The error type defaults to [`AppError`] but callers

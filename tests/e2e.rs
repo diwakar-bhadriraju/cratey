@@ -383,6 +383,32 @@ fn sha256_hex(bytes: &[u8]) -> String {
 }
 
 #[test]
+fn corrupt_db_is_backed_up_and_replaced_with_empty() {
+    with_env("Z.AppImage", |_env| {
+        let db_path = cratey::paths::db_file();
+        // Write garbage that serde_json cannot parse.
+        std::fs::write(&db_path, b"this is not json").unwrap();
+        // Make sure we don't have a leftover lock from a previous test.
+        let _ = std::fs::remove_file(db_path.with_extension("lock"));
+
+        // Opening now must surface a DatabaseCorrupted error pointing at the
+        // backup, and the original must have been moved aside.
+        let backup = match cratey::db::Db::open() {
+            Err(cratey::error::AppError::DatabaseCorrupted { path }) => path,
+            Err(other) => panic!("expected DatabaseCorrupted, got {other:?}"),
+            Ok(_) => panic!("expected Db::open to fail on corrupt DB"),
+        };
+        assert!(backup.exists(), "backup file should exist");
+        assert!(
+            std::fs::read_to_string(&db_path)
+                .map(|s| s.is_empty())
+                .unwrap_or(true),
+            "the live DB should now be empty (or absent), not the corrupt data"
+        );
+    });
+}
+
+#[test]
 fn register_existing_picks_up_a_pre_placed_appimage() {
     with_env("Rescan.AppImage", |env| {
         // Drop the AppImage directly in the storage dir without going

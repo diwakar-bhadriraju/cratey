@@ -33,7 +33,27 @@ impl Db {
             .map_err(|_| AppError::Config("another instance is running".to_string()))?;
 
         let doc = if db_file().exists() {
-            load_document(&db_file())?
+            match load_document(&db_file()) {
+                Ok(d) => d,
+                Err(_) => {
+                    // Don't silently lose data on parse failure: back up the
+                    // corrupt file and start with an empty library. The user
+                    // sees a toast and can recover manually.
+                    let path = db_file();
+                    let stamp = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0);
+                    let backup = path.with_extension(format!("corrupt-{stamp}.json"));
+                    let _ = std::fs::rename(&path, &backup);
+                    log::error!(
+                        "DB at {} was unparseable; moved to {}",
+                        path.display(),
+                        backup.display()
+                    );
+                    return Err(AppError::DatabaseCorrupted { path: backup });
+                }
+            }
         } else {
             DbDocument::default()
         };

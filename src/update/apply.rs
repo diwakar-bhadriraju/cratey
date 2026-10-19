@@ -12,7 +12,7 @@
 //! The `.desktop` file and icon are NOT touched: the binary path is unchanged,
 //! so identity and integration remain valid.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 
 use chrono::Utc;
@@ -59,14 +59,18 @@ pub fn apply(app: &mut ManagedApp, new: &NewRelease, _provider: &dyn UpdateProvi
         )));
     }
 
-    // Step 6: chmod.
-    let _ = make_exec(binary);
+    // Step 6: chmod. A failure here leaves the binary non-executable, which
+    // means "Update applied" would mislead the user — surface it.
+    make_exec(binary)?;
 
     // Step 7: atomic DB write.
     app.known_version = Some(new.version.clone());
     app.last_updated_at = Some(Utc::now());
     app.update_status = crate::model::UpdateStatus::UpToDate;
     commit(app)?;
+    // Step 8: clean up the staged .prev (we successfully replaced the binary;
+    // keeping .prev around would only leak disk over time).
+    let _ = std::fs::remove_file(&prev);
     Ok(())
 }
 
@@ -90,7 +94,9 @@ fn probe_size(url: &str) -> Result<u64> {
     }
 }
 
-/// Downloads `new.download_url` into `dir`; verifies sha256 when provided.
+/// Streams `new.download_url` to a temp file under `dir`, verifying the
+/// byte count and (optionally) sha256 as we go. Streams to disk so a
+/// 2 GiB download doesn't pin 2 GiB of RAM.
 fn download_to_tempdir(new: &NewRelease, dir: &Path) -> Result<std::path::PathBuf> {
     let file_name = new
         .download_url
@@ -100,43 +106,53 @@ fn download_to_tempdir(new: &NewRelease, dir: &Path) -> Result<std::path::PathBu
         .unwrap_or("update.AppImage");
     let dest = dir.join(file_name);
 
-    let mut bytes_out: Vec<u8> = Vec::new();
     let mut reader = ureq::get(&new.download_url)
         .call()
         .map_err(|e| AppError::Update(format!("download failed: {e}")))?
         .into_body()
         .into_reader();
 
+    let mut out = std::fs::File::create(&dest)?;
     let mut buf = vec![0u8; 5 * 1024 * 1024];
+    let mut total: u64 = 0;
+    use sha2::{Digest, Sha256};
+    let mut hasher = new.sha256.as_ref().map(|_| Sha256::new());
+
     loop {
         let n = reader
             .read(&mut buf)
-            .map_err(|e| AppError::Update(e.to_string()))?;
+            .map_err(|e| AppError::Update(format!("read: {e}")))?;
         if n == 0 {
             break;
         }
-        bytes_out.extend_from_slice(&buf[..n]);
-    }
-
-    // sha256 verification, if provided.
-    if let Some(expected) = &new.sha256 {
-        use sha2::{Digest, Sha256};
-        let actual = Sha256::digest(&bytes_out);
-        let actual_hex = hex::encode(actual);
-        if actual_hex.to_lowercase() != expected.to_lowercase() {
+        if let Some(h) = hasher.as_mut() {
+            h.update(&buf[..n]);
+        }
+        total = total.saturating_add(n as u64);
+        if total > MAX_DOWNLOAD_BYTES {
             return Err(AppError::Update(format!(
-                "sha256 mismatch: expected {expected}, got {actual_hex}"
+                "download exceeds {MAX_DOWNLOAD_BYTES} bytes"
             )));
+        }
+        std::io::Write::write_all(&mut out, &buf[..n])
+            .map_err(|e| AppError::Update(format!("write temp: {e}")))?;
+    }
+    out.flush()
+        .map_err(|e| AppError::Update(format!("flush temp: {e}")))?;
+    drop(out);
+
+    if let Some(expected) = &new.sha256 {
+        if let Some(h) = hasher {
+            let actual_hex = hex::encode(h.finalize());
+            if actual_hex.to_lowercase() != expected.to_lowercase() {
+                let _ = std::fs::remove_file(&dest);
+                return Err(AppError::Update(format!(
+                    "sha256 mismatch: expected {expected}, got {actual_hex}"
+                )));
+            }
         }
     }
 
-    if bytes_out.len() as u64 > MAX_DOWNLOAD_BYTES {
-        return Err(AppError::Update(
-            "downloaded file exceeds 2 GiB".to_string(),
-        ));
-    }
-
-    std::fs::write(&dest, &bytes_out)?;
     Ok(dest)
 }
 

@@ -94,7 +94,7 @@ impl SimpleComponent for App {
         root: Self::Root,
         sender: ComponentSender<Self>,
     ) -> ComponentParts<Self> {
-        let (apps, settings) = load_state();
+        let (apps, settings, db_err) = load_state();
 
         let toast_overlay = adw::ToastOverlay::new();
         root.set_content(Some(&toast_overlay));
@@ -236,6 +236,19 @@ impl SimpleComponent for App {
                 "Pick a storage directory to begin".into(),
             ));
             open_folder_picker(&root, sender.clone());
+        }
+
+        if let Some(err) = db_err {
+            let msg = match err {
+                crate::error::AppError::DatabaseCorrupted { path } => {
+                    format!(
+                        "Database was unreadable. Backup at {}. Starting empty — recover it then restart.",
+                        path.display()
+                    )
+                }
+                other => other.to_string(),
+            };
+            sender.input(AppMsg::ShowToast(msg));
         }
 
         ComponentParts { model, widgets: () }
@@ -648,7 +661,14 @@ impl App {
     }
 
     fn show_preview(&mut self, path: PathBuf, sender: &ComponentSender<Self>) {
-        let base_dir = self.settings.base_dir.clone().unwrap();
+        // Defensive: import_files sets base_dir before queueing, but a
+        // concurrent Rescan/cancel race could clear it between queue and
+        // dequeue. Surface a toast rather than panicking on None.
+        let Some(base_dir) = self.settings.base_dir.clone() else {
+            self.toast("Storage directory unset; pick one in Preferences first");
+            open_folder_picker(&self.root, sender.clone());
+            return;
+        };
 
         let window = adw::Window::new();
         window.set_title(Some("Import Preview"));
@@ -1101,7 +1121,7 @@ fn repair_app(app: &ManagedApp) -> Result<()> {
     Ok(())
 }
 
-fn load_state() -> (Vec<ManagedApp>, Settings) {
+fn load_state() -> (Vec<ManagedApp>, Settings, Option<crate::error::AppError>) {
     match Db::open() {
         Ok(db) => {
             let mut apps = db.apps().to_vec();
@@ -1111,9 +1131,9 @@ fn load_state() -> (Vec<ManagedApp>, Settings) {
             // re-imported AppImage doesn't surface twice.
             let mut seen = std::collections::HashSet::new();
             apps.retain(|a| seen.insert(a.installed_path.clone()));
-            (apps, settings)
+            (apps, settings, None)
         }
-        Err(_) => (Vec::new(), Settings::default()),
+        Err(e) => (Vec::new(), Settings::default(), Some(e)),
     }
 }
 
