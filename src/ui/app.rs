@@ -68,6 +68,8 @@ pub enum AppMsg {
     SetNotificationPref(NotificationPref),
     SetConfirmInstall(bool),
     SetConfirmUninstall(bool),
+    /// Remove the given app id from the in-memory list and DB, then refresh.
+    FinishUninstall(String),
     Rescan,
     About,
     Quit,
@@ -327,20 +329,61 @@ impl SimpleComponent for App {
                 self.settings.confirm_before_uninstall = v;
                 self.commit_settings();
             }
+            AppMsg::FinishUninstall(id) => {
+                // Drop selection first so the deleted index can't bleed
+                // into the rebuild (no dangling pointers).
+                self.selected = None;
+                self.apps.retain(|a| a.id != id);
+                self.commit_state();
+                sender.input(AppMsg::Refresh);
+            }
             AppMsg::Rescan => {
-                // Re-list AppImages already present in the storage dir.
+                // Find AppImages in the storage dir that aren't already
+                // managed, and register each one in place (no copy, no
+                // preview — the user already knows what's there).
                 if let Some(base) = &self.settings.base_dir {
                     let found = crate::appimage::scan::scan_dir(base);
-                    if found.is_empty() {
-                        self.toast("No AppImages found in the storage directory");
-                    } else {
-                        self.toast(format!("Found {} AppImage(s) (import to add)", found.len()));
+                    let mut registered = 0usize;
+                    let mut skipped = 0usize;
+                    let mut failed: Vec<String> = Vec::new();
+                    for f in found {
+                        if self.apps.iter().any(|a| a.installed_path == f) {
+                            skipped += 1;
+                            continue;
+                        }
+                        let display = f
+                            .file_stem()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "Untitled App".into());
+                        match crate::integration::install::register_existing(&f, &display) {
+                            Ok(app) => {
+                                if let Some(existing) =
+                                    self.apps.iter_mut().find(|a| a.id == app.id)
+                                {
+                                    *existing = app;
+                                } else {
+                                    self.apps.push(app);
+                                }
+                                registered += 1;
+                            }
+                            Err(e) => failed.push(format!("{}: {e}", f.display())),
+                        }
                     }
-                    let _ = found;
+                    if registered > 0 || !failed.is_empty() {
+                        self.commit_state();
+                    }
+                    let mut msg = format!("Rescan: {registered} added, {skipped} already managed");
+                    if !failed.is_empty() {
+                        msg.push_str(&format!(", {} failed", failed.len()));
+                        for f in &failed {
+                            log::warn!("rescan failed: {f}");
+                        }
+                    }
+                    self.toast(msg);
+                    sender.input(AppMsg::Refresh);
                 } else {
                     self.toast("No storage directory set");
                 }
-                sender.input(AppMsg::Refresh);
             }
             AppMsg::About => show_about(&self.root),
             AppMsg::Quit => self.root.close(),
@@ -784,11 +827,7 @@ impl App {
                     if resp == "int" {
                         let _ = std::fs::remove_file(&desktop);
                     }
-                    if let Ok(mut db) = Db::open() {
-                        db.apps_mut().retain(|a| a.id != id);
-                        let _ = db.commit();
-                    }
-                    s.input(AppMsg::Refresh);
+                    s.input(AppMsg::FinishUninstall(id.clone()));
                 }
             },
         );
@@ -796,7 +835,11 @@ impl App {
 
     fn show_preferences_window(&self, sender: &ComponentSender<Self>) {
         let dialog = adw::PreferencesDialog::new();
-        dialog.set_content_width(620);
+        // Generous max so labels with long paths/instructions aren't truncated
+        // on common display scalings. Content height goes well above the
+        // minimum to keep pages compact rather than stretched.
+        dialog.set_content_width(860);
+        dialog.set_content_height(560);
         // Local helper: a ComboRow with a label list.
         let mkcombo = |title: &str, options: &[&str]| -> adw::ComboRow {
             let combo = adw::ComboRow::new();
@@ -970,6 +1013,10 @@ impl App {
         dialog.add(&updates);
         dialog.add(&notif);
         dialog.add(&safety);
+        // Re-apply size after pages are populated so the dialog doesn't
+        // collapse to the preview size.
+        dialog.set_content_width(860);
+        dialog.set_content_height(560);
         dialog.present(Some(&self.root));
     }
 }

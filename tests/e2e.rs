@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use parking_lot::Mutex;
+use std::os::unix::fs::PermissionsExt;
 use tempfile::TempDir;
 
 use cratey::db::Db;
@@ -379,4 +380,47 @@ fn respond(mut stream: std::net::TcpStream, status: &str, ctype: &[u8], body: &[
 fn sha256_hex(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     hex::encode(Sha256::digest(bytes))
+}
+
+#[test]
+fn register_existing_picks_up_a_pre_placed_appimage() {
+    with_env("Rescan.AppImage", |env| {
+        // Drop the AppImage directly in the storage dir without going
+        // through the install flow (simulates migrating from another
+        // manager or recovering from a crash).
+        let src = env.base.join("Rescan.AppImage");
+        std::fs::write(&src, fixture_elf()).unwrap();
+        std::fs::set_permissions(&src, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        // register_existing picks it up in place — no copy.
+        cratey::integration::install::register_existing(&src, "Rescan").unwrap();
+
+        // The .desktop file references the correct binary and the source
+        // file is unchanged.
+        let apps_dir = cratey::paths::applications_dir();
+        let mut found = None;
+        for entry in std::fs::read_dir(&apps_dir).unwrap() {
+            let entry = entry.unwrap();
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("desktop") {
+                let t = std::fs::read_to_string(entry.path()).unwrap();
+                if t.contains("X-Cratey-Managed=true") && t.contains("Name=Rescan") {
+                    found = Some((entry.path(), t));
+                    break;
+                }
+            }
+        }
+        let (_path, text) = found.expect("rescanned desktop file");
+        assert!(text.contains(&format!("Exec=\"{}\"", src.display())));
+        assert!(src.is_file(), "source must not be moved");
+
+        // The DB has the app registered with installed_path == src.
+        let db = Db::open().unwrap();
+        let app = db
+            .document()
+            .apps
+            .iter()
+            .find(|a| a.installed_path == src)
+            .expect("app registered in db");
+        assert_eq!(app.display_name, "Rescan");
+    });
 }

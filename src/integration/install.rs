@@ -187,6 +187,101 @@ fn commit_app(app: ManagedApp) -> Result<()> {
     db.commit()
 }
 
+/// Registers a pre-existing AppImage as a managed app without copying it.
+///
+/// Used when the user has AppImages already in their storage directory that
+/// were not installed via Cratey (e.g., dropped there manually or imported
+/// from another manager). The AppImage stays in place; we just synthesize the
+/// icon, write the `.desktop` file, and register it in the DB.
+pub fn register_existing(source_path: &Path, display_name: &str) -> Result<ManagedApp> {
+    let id = crate::model::new_app_id();
+    let installed = source_path.to_path_buf();
+
+    if !installed.is_file() {
+        return Err(AppError::Io(format!(
+            "source {} is not a readable file",
+            installed.display()
+        )));
+    }
+
+    // Make it executable in case it isn't already.
+    chmod_exec(&installed)?;
+
+    let icon = crate::paths::icons_dir().join(format!("{id}.png"));
+    let desktop = crate::paths::applications_dir().join(crate::model::desktop_file_basename(&id));
+
+    // Synthesize the icon.
+    synthesize_icon(display_name, &icon)?;
+
+    // Write (or adopt) the .desktop file.
+    let installed_for_entry = installed.clone();
+    let id_for_entry = id.clone();
+    let desktop_path = match resolve_collision(&PlannedInstall {
+        id: id.clone(),
+        display_name: display_name.to_string(),
+        source_path: installed.clone(),
+        installed_path: installed_for_entry.clone(),
+        icon_path: icon.clone(),
+        desktop_file_path: desktop.clone(),
+        base_dir: Some(
+            installed
+                .parent()
+                .map(|p| p.to_path_buf())
+                .unwrap_or_default(),
+        ),
+        move_source: false,
+    })? {
+        Collision::Write => {
+            let entry = DesktopEntry {
+                name: display_name.to_string(),
+                generic_name: String::new(),
+                comment: String::new(),
+                exec: installed_for_entry.clone(),
+                working_dir: None,
+                icon: Some(icon.clone()),
+                categories: String::new(),
+                mime_types: Vec::new(),
+                startup_wm_class: display_name.to_string(),
+                appimage_identifier: display_name.to_string(),
+                internal_id: id_for_entry.clone(),
+            };
+            write_entry(&desktop, &entry)?;
+            desktop
+        }
+        Collision::Adopt(p) => p,
+        Collision::Refuse(_) => unreachable!("resolve_collision returns Result"),
+    };
+
+    // Refresh the desktop database (best-effort).
+    if let Ok(apps_dir) = std::fs::canonicalize(crate::paths::applications_dir()) {
+        crate::integration::desktop::refresh_databases(&apps_dir);
+    }
+
+    let app = ManagedApp {
+        id: id.clone(),
+        display_name: display_name.to_string(),
+        source_filename: installed
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default(),
+        installed_path: installed.clone(),
+        desktop_file_basename: crate::model::desktop_file_basename(&id),
+        desktop_file_path: desktop_path,
+        icon_path: Some(icon.clone()),
+        imported_at: Utc::now(),
+        last_updated_at: None,
+        known_version: None,
+        latest_version: None,
+        update_status: UpdateStatus::Unknown,
+        update_provider: UpdateProvider::None,
+        integration_status: IntegrationStatus::Healthy,
+        owned_files: vec![installed.clone(), icon.clone()],
+    };
+
+    commit_app(app.clone())?;
+    Ok(app)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
